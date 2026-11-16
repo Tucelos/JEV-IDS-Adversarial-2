@@ -66,6 +66,13 @@
       "output": 10.0,
       "source": "https://www.anthropic.com/pricing",
       "note": "Anthropic Claude Sonnet 5.5."
+    },
+    "Clef": {
+      "input": 0.0,
+      "cached_input": 0.0,
+      "output": 0.0,
+      "source": "https://notebooks.amd.com/tokenlab",
+      "note": "TypeSafe System One model served by AMD TokenLab; list price not published, recorded as 0 so cost is reported as unpriced."
     }
   }
 }

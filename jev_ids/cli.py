@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument(
         "--detector",
         required=True,
-        help="jev, gemini_decision, llm:deepseek, llm:openai, llm:gemini, random_forest, isolation_forest or knn",
+        help="jev, gemini_decision, systemone, llm:deepseek, llm:openai, llm:gemini, random_forest, isolation_forest or knn",
     )
     runner.add_argument("--split", required=True, help="internal, pilot, smoke, ...")
     runner.add_argument(
@@ -146,7 +146,7 @@ def _add_adversarial_parser(commands: Any) -> None:
     adv = commands.add_parser("adversarial", help="closed-loop study between Agno attacker and defender agents")
     adv.add_argument("--dataset", required=True, type=Path, help="the card: data/<name>/dataset.json")
     adv.add_argument("--split", default="smoke", help="split under data/<name>/splits/")
-    adv.add_argument("--detector", required=True, help="jev, gemini_decision, llm:deepseek, llm:openai or llm:gemini")
+    adv.add_argument("--detector", required=True, help="jev, gemini_decision, systemone, llm:deepseek, llm:openai or llm:gemini")
     adv.add_argument("--detector-model", help="optional detector model override")
     adv.add_argument("--attacker", default="claude", help="attacker Agno provider: claude, hydrogen, gemini, openai, deepseek")
     adv.add_argument("--attacker-model", help="optional attacker model id")

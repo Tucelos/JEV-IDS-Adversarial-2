@@ -73,6 +73,11 @@ def make_train(categories: Sequence[str]) -> list[Flow]:
     return [make_flow(index, category, value=str(index)) for index, category in enumerate(categories)]
 
 
+# One attack Flow and a one-per-category training set, shared by the decision-detector tests (Gemini Decision, System One).
+FLOW = make_flow(7, "dos", value="2")
+TRAIN = make_train(["normal", "dos", "probe"])
+
+
 def write_dataset(root: Path, config: Config, splits: Mapping[str, Sequence[Flow]]) -> Path:
     """A dataset folder under `root` in the shared shape.
 

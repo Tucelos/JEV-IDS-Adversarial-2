@@ -26,10 +26,8 @@ from jev_ids.detectors.gemini_decision import (
     measurements,
 )
 from jev_ids.run import RunSpec, build_detector, sample_examples
-from tests.helpers import CATEGORIES, CONFIG, JEV_PROMPT, make_flow, make_train, no_sleep
+from tests.helpers import CATEGORIES, CONFIG, FLOW, JEV_PROMPT, TRAIN, no_sleep
 
-FLOW = make_flow(7, "dos", value="2")
-TRAIN = make_train(["normal", "dos", "probe"])
 # Keeping the SDK's client class, because one test replaces `genai.Client` to read what the detector builds it with.
 SDK_CLIENT = genai.Client
 # Listing what the scripted transport answers with: a status and a JSON body, or an exception httpx would raise.

@@ -56,7 +56,7 @@ DETECTOR_STOPPED = "detector_stopped"
 AGENT_UNAVAILABLE = "agent_unavailable"
 MAX_ROUNDS_REACHED = "max_rounds_reached"
 # Listing the detectors whose instructions the defender can rewrite, besides every `llm:<provider>`.
-DECISION_DETECTORS = ("jev", "gemini_decision")
+DECISION_DETECTORS = ("jev", "gemini_decision", "systemone")
 
 
 def reinforce_instructions(base_instructions: str) -> str:

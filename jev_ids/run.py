@@ -38,6 +38,7 @@ from jev_ids.detectors.jev import JevDetector
 from jev_ids.detectors.knn import KNNDetector
 from jev_ids.detectors.llm import LLMDetector
 from jev_ids.detectors.random_forest import RandomForestDetector
+from jev_ids.detectors.systemone import SystemOneDetector
 from jev_ids.records import append_prediction, complete_prediction, read_predictions, write_config
 from jev_ids.selector import Selector, Space
 from jev_ids.stream import Choose, Memory, random_examples, split_names, stream_cell
@@ -52,7 +53,9 @@ WHOLE_MEMORY = ("random_forest", "isolation_forest", "knn")
 
 # Typing a Detector as the union of the five, because they share no base class
 # and the run loop only needs `name`, `model`, `prompt_hash` and `predict`, which each of them has.
-Detector = JevDetector | GeminiDecisionDetector | LLMDetector | RandomForestDetector | IsolationForestDetector | KNNDetector
+Detector = (
+    JevDetector | GeminiDecisionDetector | SystemOneDetector | LLMDetector | RandomForestDetector | IsolationForestDetector | KNNDetector
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,8 @@ def build_detector(spec: RunSpec, config: Config) -> Detector:
         return JevDetector(load_prompt(prompts / "jev.json"), spec.record)
     if spec.detector == "gemini_decision":
         return GeminiDecisionDetector(load_prompt(prompts / "jev.json"), spec.model_id, spec.record)
+    if spec.detector == "systemone":
+        return SystemOneDetector(load_prompt(prompts / "jev.json"), spec.model_id, spec.record)
     if spec.detector in ("llm:deepseek", "llm:openai", "llm:gemini"):
         provider = spec.detector.removeprefix("llm:")
         return LLMDetector(load_prompt(prompts / "llm.md"), provider, spec.model_id, spec.record)
