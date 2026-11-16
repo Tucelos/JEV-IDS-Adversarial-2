@@ -6,10 +6,14 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
-    "agno[openai,google]>=3.0.10",
+    "agno[openai,google,anthropic,sqlite]>=3.0.10",
+    "google-genai>=3.2.0",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
     "scikit-learn>=1.9.1",
+    # Asking for SQLAlchemy's asyncio target because `agno.db.sqlite` imports `sqlalchemy.ext.asyncio`, which needs greenlet,
+    # and neither agno's `sqlite` extra nor SQLAlchemy 2.1 installs it.
+    "sqlalchemy[asyncio]>=2.1.8",
     "typesafe-sdk>=0.7.1",
 ]
 
