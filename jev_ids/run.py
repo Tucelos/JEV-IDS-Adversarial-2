@@ -32,6 +32,7 @@ from jev_ids import ROOT, dataset
 from jev_ids.controller import BETA, Controlled, KController
 from jev_ids.dataset import Config, Flow
 from jev_ids.detectors import random_forest
+from jev_ids.detectors.gemini_decision import GeminiDecisionDetector
 from jev_ids.detectors.isolation_forest import IsolationForestDetector
 from jev_ids.detectors.jev import JevDetector
 from jev_ids.detectors.knn import KNNDetector
@@ -51,7 +52,7 @@ WHOLE_MEMORY = ("random_forest", "isolation_forest", "knn")
 
 # Typing a Detector as the union of the five, because they share no base class
 # and the run loop only needs `name`, `model`, `prompt_hash` and `predict`, which each of them has.
-Detector = JevDetector | LLMDetector | RandomForestDetector | IsolationForestDetector | KNNDetector
+Detector = JevDetector | GeminiDecisionDetector | LLMDetector | RandomForestDetector | IsolationForestDetector | KNNDetector
 
 
 @dataclass(frozen=True)
@@ -119,10 +120,12 @@ def load_prompt(path: Path) -> dict[str, Any]:
 
 
 def build_detector(spec: RunSpec, config: Config) -> Detector:
-    """The Detector named in the spec; Jev and the LLMs get their prompt file."""
+    """The Detector named in the spec; Jev, Gemini Decision and the LLMs get their prompt file."""
     prompts = ROOT / "prompts" / config["name"]
     if spec.detector == "jev":
         return JevDetector(load_prompt(prompts / "jev.json"), spec.record)
+    if spec.detector == "gemini_decision":
+        return GeminiDecisionDetector(load_prompt(prompts / "jev.json"), spec.model_id, spec.record)
     if spec.detector in ("llm:deepseek", "llm:openai", "llm:gemini"):
         provider = spec.detector.removeprefix("llm:")
         return LLMDetector(load_prompt(prompts / "llm.md"), provider, spec.model_id, spec.record)

@@ -72,6 +72,15 @@ class LLMDetector:
         # on the ChatGPT path, the OAuth tokens. An Agent is cheap and built per call.
         self.agno_model: Any = make_model(provider, self.model)
 
+    @property
+    def instructions(self) -> str:
+        """Current overview instructions in the prompt template."""
+        return extract_overview(self.template)
+
+    def set_instructions(self, instructions_text: str) -> None:
+        """Update the overview instructions in the prompt template."""
+        self.template = replace_overview(self.template, instructions_text)
+
     def predict(self, flow: Flow, examples: Sequence[Flow]) -> dict[str, Any]:
         """One Agent run for one Flow; the Examples travel in the instructions.
 
@@ -102,6 +111,29 @@ class LLMDetector:
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"[:500]}
         return measurements(run, (time.perf_counter() - started) * 1000)
+
+
+def extract_overview(template: str) -> str:
+    """Return the body of the `# Overview` section, or the full template if absent."""
+    normalized = template.replace("\r\n", "\n")
+    marker = "# Overview\n\n"
+    if not normalized.startswith(marker):
+        return normalized.strip()
+    rest = normalized[len(marker) :]
+    next_heading = rest.find("\n\n# ")
+    return rest if next_heading == -1 else rest[:next_heading]
+
+
+def replace_overview(template: str, new_instructions: str) -> str:
+    """Return `template` with the `# Overview` section body replaced by `new_instructions`."""
+    normalized = template.replace("\r\n", "\n")
+    marker = "# Overview\n\n"
+    if not normalized.startswith(marker):
+        return new_instructions
+    rest = normalized[len(marker) :]
+    next_heading = rest.find("\n\n# ")
+    suffix = "" if next_heading == -1 else rest[next_heading:]
+    return f"{marker}{new_instructions.strip()}{suffix}"
 
 
 def instructions(template: str, examples: Sequence[Flow], record: str = "compact") -> str:

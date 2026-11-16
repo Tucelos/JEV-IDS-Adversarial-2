@@ -23,18 +23,20 @@ from typing import Any
 
 from typesafe_sdk import RetryPolicy, SystemOneResponse, TypeSafeAPIConnectionError, TypeSafeAPIError, TypeSafeClient
 
-from jev_ids.dataset import Flow, record_text
+from jev_ids.dataset import Flow
+from jev_ids.detectors import (
+    BACKOFF_SECONDS,
+    MAX_ATTEMPTS,
+    RETRYABLE_STATUS,
+    TIMEOUT_SECONDS,
+    build_decision_body,
+    retry_request,
+    template_instructions,
+    with_template_instructions,
+)
 
 # Naming the variable that holds the API key, which the SDK reads by itself.
 API_KEY_VAR = "TYPESAFE_API_KEY"
-# Allowing five attempts with exponential backoff on rate limits (429), overload (529), server errors and network failures. Any other 4xx
-# fails at once. A failure ends as a row with `error`, never as an exception, so the run continues. The SDK's own retries stay off, because
-# a retry it made silently would hide inside `latency_ms` and escape `retries`. The run measures the successful attempt alone and counts the
-# failed ones. The runs up to 2026-09-21 went through the Vercel AI Gateway, which rate-limited 1,350 of the 1,800 pilot rows at least once.
-MAX_ATTEMPTS = 5
-BACKOFF_SECONDS = 1.0
-TIMEOUT_SECONDS = 60
-RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504, 529})
 NO_RETRY = RetryPolicy(max_retries=0, timeout=None)
 
 
@@ -59,6 +61,15 @@ class JevDetector:
         self.model: str = json.loads(self.template)["model"]
         self.client: TypeSafeClient | None = None
 
+    @property
+    def instructions(self) -> str:
+        """Current `state.instructions` sent to Jev."""
+        return template_instructions(self.template)
+
+    def set_instructions(self, instructions: str) -> None:
+        """Update `state.instructions` in the request template."""
+        self.template = with_template_instructions(self.template, instructions)
+
     def predict(self, flow: Flow, examples: Sequence[Flow]) -> dict[str, Any]:
         """One request for one Flow: what it measured, or `error` and `retries`."""
         if self.client is None:
@@ -82,18 +93,7 @@ def request_body(template: str, flow: Flow, examples: Sequence[Flow], record: st
     Returns:
         The request body, with the Flow, the Examples and the Category `criteria` filled in.
     """
-    body: dict[str, Any] = json.loads(template)
-    body["state"]["flows"] = {"under_test": record_text(flow, record)}
-    if examples:
-        body["state"]["examples"] = [
-            {
-                "record": record_text(example, record),
-                "category": example.category,
-            }
-            for example in examples
-        ]
-    body["questions"]["category"]["criteria"] = body["state"]["categories"]
-    return body
+    return build_decision_body(template, flow, examples, record)
 
 
 def attempt(client: TypeSafeClient, body: dict[str, Any]) -> dict[str, Any]:
@@ -130,17 +130,11 @@ def post(client: TypeSafeClient, body: dict[str, Any]) -> dict[str, Any]:
     Returns:
         The last attempt's result plus `retries`, the failed attempts before it. `latency_ms` measures the successful attempt alone.
     """
-    result = attempt(client, body)
-    retries = 0
-    while result.get("retryable") and retries < MAX_ATTEMPTS - 1:
-        time.sleep(BACKOFF_SECONDS * 2**retries)
-        result = attempt(client, body)
-        retries += 1
-    result.pop("retryable", None)
-    return {
-        **result,
-        "retries": retries,
-    }
+    return retry_request(
+        lambda: attempt(client, body),
+        max_attempts=MAX_ATTEMPTS,
+        backoff_seconds=BACKOFF_SECONDS,
+    )
 
 
 def measurements(body: dict[str, Any], latency_ms: float) -> dict[str, Any]:
