@@ -1,11 +1,11 @@
-"""The command line: `jev-ids run|redo-errors|metrics|compare|sign-test|threshold`, also reachable as `python -m jev_ids`.
+"""The command line: `jev-ids run|redo-errors|metrics|compare|sign-test|threshold|adversarial`, also reachable as `python -m jev_ids`.
 
 In reading order:
 
 - `parse_k` and `parse_list`: the list arguments (`--k 0,1,all`).
-- `build_parser`: the six subcommands and their arguments.
-- `run_command`, `redo_command`, `metrics_command`, `compare_command`, `sign_test_command`, `threshold_command`:
-  one handler per subcommand, each turning the parsed arguments into calls of `run` or `metrics`.
+- `build_parser`: the subcommands and their arguments.
+- `run_command`, `redo_command`, `metrics_command`, `compare_command`, `sign_test_command`, `threshold_command`, `adversarial_command`:
+  one handler per subcommand, each turning the parsed arguments into calls of `run`, `metrics` or `adversarial`.
 - `read_runs`: the rows of the run directories given, cut again at a threshold when one is given.
 - `print_csv`: a table as CSV on stdout.
 - `main`: parse, dispatch, return the exit code.
@@ -17,12 +17,14 @@ import argparse
 import csv
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
-from jev_ids import ROOT, metrics, run
+from jev_ids import ROOT, adversarial, metrics, run
+from jev_ids.agent_runtime import AgentUnavailableError
 from jev_ids.controller import BETA
 from jev_ids.dataset import RECORDS
 from jev_ids.records import Prediction, read_predictions
@@ -49,14 +51,16 @@ def parse_list(text: str) -> tuple[int | None, ...]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The six subcommands, each carrying the function that handles it."""
+    """The subcommands, each carrying the function that handles it."""
     parser = argparse.ArgumentParser(prog="jev-ids")
     commands = parser.add_subparsers(dest="command", required=True)
 
     runner = commands.add_parser("run", help="run one detector over one split")
     runner.add_argument("--dataset", required=True, type=Path, help="the card: data/<name>/dataset.json")
     runner.add_argument(
-        "--detector", required=True, help="jev, llm:deepseek, llm:openai, llm:gemini, random_forest, isolation_forest or knn"
+        "--detector",
+        required=True,
+        help="jev, gemini_decision, llm:deepseek, llm:openai, llm:gemini, random_forest, isolation_forest or knn",
     )
     runner.add_argument("--split", required=True, help="internal, pilot, smoke, ...")
     runner.add_argument(
@@ -133,7 +137,37 @@ def build_parser() -> argparse.ArgumentParser:
     tuner = commands.add_parser("threshold", help="the cut on p_attack with the best mean F1 over the validation runs given (D9)")
     tuner.add_argument("run_dirs", nargs="+", type=Path, help="results/<run_id> directories of the validation stream")
     tuner.set_defaults(handler=threshold_command)
+
+    _add_adversarial_parser(commands)
     return parser
+
+
+def _add_adversarial_parser(commands: Any) -> None:
+    adv = commands.add_parser("adversarial", help="closed-loop study between Agno attacker and defender agents")
+    adv.add_argument("--dataset", required=True, type=Path, help="the card: data/<name>/dataset.json")
+    adv.add_argument("--split", default="smoke", help="split under data/<name>/splits/")
+    adv.add_argument("--detector", required=True, help="jev, gemini_decision, llm:deepseek, llm:openai or llm:gemini")
+    adv.add_argument("--detector-model", help="optional detector model override")
+    adv.add_argument("--attacker", default="claude", help="attacker Agno provider: claude, hydrogen, gemini, openai, deepseek")
+    adv.add_argument("--attacker-model", help="optional attacker model id")
+    adv.add_argument("--defender", default="hydrogen", help="defender Agno provider: hydrogen, claude, gemini, openai, deepseek")
+    adv.add_argument("--defender-model", help="optional defender model id")
+    adv.add_argument("--rounds", type=int, default=5, help="maximum adversarial rounds")
+    adv.add_argument("--max-attempts", type=int, default=3, help="new wordings the attacker may submit; keeping or removing is free")
+    adv.add_argument("--max-note-length", type=int, default=120, help="maximum characters for service field note")
+    adv.add_argument(
+        "--noise-margin",
+        type=int,
+        default=0,
+        help="attack flows the net shift between two rounds must exceed before the turn rule reads it as a shift (0, the default)",
+    )
+    adv.add_argument("--memory-dir", type=Path, help="where the agents keep their memories across runs; default: <run_dir>/memory")
+    adv.add_argument("--initial-note", default=adversarial.INITIAL_NOTE, help="initial note used in round 1")
+    adv.add_argument("--k", type=int, default=0, help="labeled examples per category (0 uses none)")
+    adv.add_argument("--seed", type=int, default=0, help="example sampling seed when k > 0")
+    adv.add_argument("--record", choices=RECORDS, default="compact", help="compact or full record format")
+    adv.add_argument("--results-dir", type=Path, default=run.RESULTS_DIR, help="where the adv_* run directory is created")
+    adv.set_defaults(handler=adversarial_command)
 
 
 def run_command(args: argparse.Namespace) -> None:
@@ -199,6 +233,42 @@ def sign_test_command(args: argparse.Namespace) -> None:
 def threshold_command(args: argparse.Namespace) -> None:
     """`threshold`: the cut of D9 over the validation runs given, as one CSV row."""
     print_csv([metrics.best_threshold(read_runs(args.run_dirs))])
+
+
+def adversarial_command(args: argparse.Namespace) -> None:
+    """`adversarial`: run the closed-loop Agno study and print one CSV row per round.
+
+    The command exits non-zero when an agent's model fails its question before the first round, and, after the rounds are printed,
+    when the loop ended because the detector stopped answering or an agent's model failed.
+    """
+    spec = adversarial.AdversarialSpec(
+        detector=args.detector,
+        dataset=args.dataset,
+        split=args.split,
+        attacker_provider=args.attacker,
+        attacker_model=args.attacker_model,
+        defender_provider=args.defender,
+        defender_model=args.defender_model,
+        detector_model=args.detector_model,
+        max_rounds=args.rounds,
+        max_attempts=args.max_attempts,
+        max_note_length=args.max_note_length,
+        initial_note=args.initial_note,
+        k=args.k,
+        seed=args.seed,
+        record=args.record,
+        results_dir=args.results_dir,
+        noise_margin=args.noise_margin,
+        memory_dir=args.memory_dir,
+    )
+    try:
+        run_dir, history = adversarial.run_adversarial(spec)
+    except AgentUnavailableError as exc:
+        raise SystemExit(f"agent model unavailable before the first round, no detector call was made ({exc})") from exc
+    print_csv([asdict(rec) for rec in history])
+    failure = adversarial.failure_of(history)
+    if failure is not None:
+        raise SystemExit(f"stopped: {failure} at round {history[-1].round} of {run_dir}; the rows judged so far are kept")
 
 
 def read_runs(run_dirs: Sequence[Path], threshold: float | None = None) -> list[Prediction]:
