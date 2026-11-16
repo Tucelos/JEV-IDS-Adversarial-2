@@ -6,6 +6,7 @@ In reading order:
 - `AdversarialSpec`: what the CLI resolved for one run.
 - `RoundState`, `Adaptation` and `RoundRecord`: what a round starts from, how it ended, and the line it leaves in `rounds.jsonl`.
 - `state_code_for`: the compact code of a round (`N/B`, `N/R`, `S/R`, `S/B`, `N'/B`).
+- `relative_memory_dir`: the agents' memory folder as `config.json` records it, relative to the run directory.
 - `Orchestrator`: the loop `action -> detector verdict -> observation -> adaptation`, with no model of its own.
 - `failure_of`: the reason a run ended on a failure, which the CLI turns into its exit code.
 - `check_detector_name` and `run_adversarial`: the CLI entry that strings the above together.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -144,7 +146,7 @@ class Adaptation:
         who_adapts: the side that changed its action, which is the other one after a hold; None when nobody did and the loop ends.
         why_adapted: the reason of the turn (`turns.py`), or the reason the loop ended.
         next_action: what each side asked answered, in the order asked, joined by ` | `.
-        rationale: the rationale of the last side asked.
+        rationale: the rationale of each side asked, in the order asked, each prefixed by its side and joined by ` | `.
         error: the error text when an agent's model failed.
     """
 
@@ -168,6 +170,8 @@ class RoundRecord:
         instructions_sha256: the sha256 of that text, the bytes of `instructions/<label>.txt`.
         newly_alerted: attack Flows that passed in the previous round and raised an alert in this one.
         newly_passing: attack Flows that raised an alert in the previous round and passed in this one.
+        attempts_left: the new wordings the attacker could still submit when the round was judged, as its observation said.
+        rationale: what each side asked gave as its reason, in the order asked, as `Adaptation` holds it.
     """
 
     round: int
@@ -184,6 +188,7 @@ class RoundRecord:
     total_benign: int
     newly_alerted: int
     newly_passing: int
+    attempts_left: int
     f1: float
     false_alarm_rate: float
     turn: str | None
@@ -214,6 +219,25 @@ def state_code_for(note: str, instruction_label: str, first_note: str | None) ->
     else:
         note_tag = "N'"
     return f"{note_tag}/{instruction_label}"
+
+
+def relative_memory_dir(memory_dir: Path, run_dir: Path) -> str:
+    """The agents' memory folder as `config.json` records it: relative to the run directory, with forward slashes.
+
+    The default folder reads `memory`, and one beside the results folder reads `../../mem`. When no relative path exists, as between two
+    drives on Windows, the folder's own name stands alone, so no absolute path of the machine reaches a file versioned as evidence.
+
+    Args:
+        memory_dir: where the agents keep their memories.
+        run_dir: the run directory that holds `config.json`.
+
+    Returns:
+        The path from the run directory to the memory folder, or the folder's name when there is none.
+    """
+    try:
+        return Path(os.path.relpath(memory_dir, run_dir)).as_posix()
+    except ValueError:
+        return memory_dir.name
 
 
 @dataclass(frozen=True)
@@ -254,8 +278,9 @@ class _Feedback:
 
 @dataclass(frozen=True)
 class _Move:
-    """One side's answer to its turn: the action as the record shows it, its rationale and whether it changed what is in force."""
+    """One side's answer to its turn: the side, the action as the record shows it, its rationale and whether it changed anything."""
 
+    side: str
     action: str
     rationale: str
     changed: bool
@@ -264,6 +289,11 @@ class _Move:
 def _said(moves: Sequence[_Move]) -> str:
     """What the sides asked in a round answered, in the order they were asked."""
     return " | ".join(move.action for move in moves)
+
+
+def _reasoned(moves: Sequence[_Move]) -> str:
+    """What the sides asked in a round gave as their reasons, each prefixed by its side, in the order they were asked."""
+    return " | ".join(f"{move.side}: {move.rationale}" for move in moves)
 
 
 def _append_row(run_dir: Path | None, row: Prediction) -> None:
@@ -338,6 +368,8 @@ class Orchestrator:
     def _step_round(self, run: _Run, state: RoundState) -> RoundRecord:
         """One round: put the instructions in force, judge every Flow, tell each side what it may know, let one side adapt."""
         note = state.note
+        # Reading the budget before the round is closed, because a new wording the attacker submits in it spends one attempt.
+        attempts_left = state.remaining_attempts
         version = self._put_in_force(run.run_dir, state.instructions)
         plan = RoundPlan(
             note=note,
@@ -360,6 +392,7 @@ class Orchestrator:
             instructions_sha256=version.sha256,
             newly_alerted=shift.newly_alerted,
             newly_passing=shift.newly_passing,
+            attempts_left=attempts_left,
             f1=evaluation.f1,
             false_alarm_rate=evaluation.false_alarm_rate,
             **asdict(evaluation.counts),
@@ -444,10 +477,11 @@ class Orchestrator:
                 move = self._attacker_move(feedback, state) if side == ATTACKER else self._defender_move(feedback, state)
                 moves.append(move)
                 if move.changed:
-                    return Adaptation(turn.side, side, turn.reason, _said(moves), move.rationale)
+                    return Adaptation(turn.side, side, turn.reason, _said(moves), _reasoned(moves))
         except AgentUnavailableError as exc:
-            return Adaptation(turn.side, None, f"{AGENT_UNAVAILABLE}:{exc.role}", _said(moves) or None, error=exc.detail)
-        return Adaptation(turn=turn.side, why_adapted=STABLE, next_action=_said(moves), rationale=moves[-1].rationale)
+            reason = f"{AGENT_UNAVAILABLE}:{exc.role}"
+            return Adaptation(turn.side, None, reason, _said(moves) or None, _reasoned(moves), exc.detail)
+        return Adaptation(turn=turn.side, why_adapted=STABLE, next_action=_said(moves), rationale=_reasoned(moves))
 
     def _attacker_move(self, feedback: _Feedback, state: RoundState) -> _Move:
         """Ask the attacker for its note and put it in force; a new wording spends an attempt, keeping or removing the note none."""
@@ -456,14 +490,14 @@ class Orchestrator:
         if changed and decision.note:
             state.remaining_attempts = max(state.remaining_attempts - 1, 0)
         state.note = decision.note
-        return _Move(f"{ATTACKER}:{decision.action}", decision.rationale, changed)
+        return _Move(ATTACKER, f"{ATTACKER}:{decision.action}", decision.rationale, changed)
 
     def _defender_move(self, feedback: _Feedback, state: RoundState) -> _Move:
         """Ask the defender for its instructions and put them in force; the text already in force is a hold."""
         decision = self.defender.adapt(feedback.defender)
         changed = decision.instructions != state.instructions
         state.instructions = decision.instructions
-        return _Move(f"{DEFENDER}:{decision.action}->{decision.instruction_label}", decision.rationale, changed)
+        return _Move(DEFENDER, f"{DEFENDER}:{decision.action}->{decision.instruction_label}", decision.rationale, changed)
 
     def _run_fields(self, spec: AdversarialSpec) -> dict[str, Any]:
         """The fields every row of the run shares, under the names the rows of `run.execute` use."""
@@ -500,7 +534,7 @@ class Orchestrator:
             "max_attempts": spec.max_attempts,
             "max_note_length": spec.max_note_length,
             "noise_margin": spec.noise_margin,
-            "memory_dir": spec.memory_dir or out_dir / "memory",
+            "memory_dir": relative_memory_dir(spec.memory_dir or out_dir / "memory", out_dir),
             "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         records.write_config(out_dir, config_payload)

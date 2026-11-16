@@ -142,9 +142,9 @@ def attacker_says(action: str, note: str = "", rationale: str = "scripted") -> s
     return AttackerDecision.model_validate({"action": action, "note": note, "rationale": rationale}).model_dump_json()
 
 
-def defender_says(action: str, instructions: str = "", label: str = "?") -> str:
+def defender_says(action: str, instructions: str = "", label: str = "?", rationale: str = "scripted") -> str:
     """The JSON a model would answer for a defender decision; `label` is whatever the model chose to call it."""
-    fields = {"action": action, "instruction_label": label, "instructions": instructions, "rationale": "scripted"}
+    fields = {"action": action, "instruction_label": label, "instructions": instructions, "rationale": rationale}
     return DefenderDecision.model_validate(fields).model_dump_json()
 
 

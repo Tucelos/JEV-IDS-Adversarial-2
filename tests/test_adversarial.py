@@ -1,7 +1,9 @@
 """The closed adversarial loop on doubles: who adapts and why, what a run writes, how it stops, and the `adversarial` subcommand."""
 
+import csv
 import hashlib
 import json
+import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import Any
 import pytest
 
 from jev_ids import ROOT, adversarial, cli, run
-from jev_ids.adversarial import INITIAL_NOTE, REINFORCED_SUFFIX, RoundRecord, failure_of, reinforce_instructions
+from jev_ids.adversarial import INITIAL_NOTE, REINFORCED_SUFFIX, RoundRecord, failure_of, reinforce_instructions, relative_memory_dir
 from jev_ids.dataset import Config
 from jev_ids.detectors.llm import extract_overview, replace_overview
 from jev_ids.evaluator import DETECTOR_FAILURE_LIMIT, normalize_wording, sanitize_note
@@ -88,6 +90,8 @@ def test_both_sides_act_although_some_attacks_always_pass(canonical: Played) -> 
     # The quiet attack, missed under B and caught under R, passes again when the defender relaxes: that is `regime_loosened`.
     assert column(history, "why_adapted") == ["attack_passed", "attack_alerted", "attack_passed", "regime_loosened", "max_rounds_reached"]
     assert column(history, "next_action") == ["defender:reinforce->R", "attacker:remove", "defender:relax->B", "attacker:reformulate", None]
+    # Each round gives the reason of the one side asked, prefixed by its side, and the last round asks nobody.
+    assert column(history, "rationale") == ["defender: scripted", "attacker: scripted", "defender: scripted", "attacker: scripted", ""]
     assert column(history, "instruction_label") == ["B", "R", "R", "B", "B"]
 
 
@@ -107,6 +111,8 @@ def test_only_a_new_wording_spends_an_attempt_and_an_alerted_one_is_retired(cano
     told = attacker.memory.state["attempt_history"]
     # Removing the note after round 2 is free; rewriting it after round 4 spends one of the three attempts.
     assert [entry["remaining_attempts"] for entry in told] == [3, 3, 3, 3, 2]
+    # The record keeps the budget its observation said, so the attempt spent after round 4 shows from round 5 on.
+    assert column(canonical.history, "attempts_left") == [entry["remaining_attempts"] for entry in told]
     assert [(entry["attempts"], entry["alerts"]) for entry in told] == [(3, 0), (3, 2), (3, 2), (3, 1), (3, 0)]
     assert list(attacker.retired) == [normalize_wording(sanitize_note(INITIAL_NOTE, 60))]
 
@@ -175,12 +181,15 @@ def test_loop_without_a_run_directory_judges_and_writes_nothing(agents: AgentFac
 
 def test_a_side_that_holds_passes_the_turn_and_two_holds_end_the_loop(agents: AgentFactory, tmp_path: Path) -> None:
     # The defender keeps B in round 1, so the attacker is asked and removes its note; in round 2 both keep what is in force.
-    loop = agents.loop([attacker_says("remove"), attacker_says("keep")], [defender_says("keep"), defender_says("keep", "Other text.")])
-    history = play(loop, tmp_path).history
+    attacker = [attacker_says("remove", rationale="a1"), attacker_says("keep", rationale="a2")]
+    defender = [defender_says("keep", rationale="d1"), defender_says("keep", "Other text.", rationale="d2")]
+    history = play(agents.loop(attacker, defender), tmp_path).history
     assert column(history, "turn") == ["defender", "attacker"]
     assert column(history, "who_adapts") == ["attacker", None]
     assert column(history, "why_adapted") == ["attack_passed", "stable"]
     assert column(history, "next_action") == ["defender:keep->B | attacker:remove", "attacker:keep | defender:keep->B"]
+    # The reasons of every side asked come in the order asked, each prefixed by its side, not the last one alone.
+    assert column(history, "rationale") == ["defender: d1 | attacker: a1", "attacker: a2 | defender: d2"]
     assert column(history, "state_code") == ["N/B", "S/B"]
     assert failure_of(history) is None
 
@@ -238,17 +247,17 @@ def test_failing_agent_model_ends_the_loop_and_keeps_the_rows(
 
 
 @pytest.mark.parametrize(
-    ("scripts", "said"),
+    ("scripts", "said", "reasoned"),
     [
-        (([RuntimeError("503 overloaded")], [defender_says("keep")]), "defender:keep->B"),
-        ((SILENT_MODEL, [RuntimeError("401 invalid key")]), None),
+        (([RuntimeError("503 overloaded")], [defender_says("keep")]), "defender:keep->B", "defender: scripted"),
+        ((SILENT_MODEL, [RuntimeError("401 invalid key")]), None, ""),
     ],
 )
 def test_failure_keeps_what_the_side_asked_before_it_answered(
-    agents: AgentFactory, tmp_path: Path, scripts: tuple[Script, Script], said: str | None
+    agents: AgentFactory, tmp_path: Path, scripts: tuple[Script, Script], said: str | None, reasoned: str
 ) -> None:
     (record,) = play(agents.loop(*scripts), tmp_path).history
-    assert (record.next_action, record.rationale) == (said, "")
+    assert (record.next_action, record.rationale) == (said, reasoned)
 
 
 def install_doubles(
@@ -281,13 +290,18 @@ def cli_args(results_dir: Path, *extra: str) -> list[str]:
     return ["adversarial", "--dataset", str(NSL_KDD_CARD), "--detector", "jev", "--results-dir", str(results_dir), *extra]
 
 
-def test_cli_adversarial_subcommand(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+def run_two_rounds(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> tuple[str, Path]:
+    """Run the `adversarial` command for two rounds on doubles; returns what it printed and the run directory it wrote."""
     # Answering the question asked before round 1, then one decision of the defender; the attacker is never given a turn.
     install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK", defender_says("reinforce")])
     assert cli.main(cli_args(tmp_path, "--rounds", "2", "--noise-margin", "1")) == 0
-    stdout = capsys.readouterr().out
-    assert stdout.splitlines()[0].startswith("round,state_code,note,instruction_label,instructions_sha256,")
     (run_dir,) = tmp_path.glob("adv_nsl-kdd_jev_*")
+    return capsys.readouterr().out, run_dir
+
+
+def test_cli_adversarial_subcommand(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    stdout, run_dir = run_two_rounds(monkeypatch, capsys, tmp_path)
+    assert stdout.splitlines()[0].startswith("round,state_code,note,instruction_label,instructions_sha256,")
     config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     assert (config["mode"], config["noise_margin"]) == ("adversarial", 1)
     # The inputs a rerun needs: the Example draw, how the detector read a Flow and the note of round 1.
@@ -295,6 +309,19 @@ def test_cli_adversarial_subcommand(monkeypatch: pytest.MonkeyPatch, capsys: pyt
     assert sorted(path.name for path in (run_dir / "memory").iterdir() if path.suffix == ".db") == ["attacker.db", "defender.db"]
     assert sorted(path.name for path in (run_dir / "instructions").iterdir()) == ["B.txt", "R.txt"]
     assert column([RoundRecord(**line) for line in read_jsonl(run_dir / "rounds.jsonl")], "state_code") == ["N/B", "N/R"]
+
+
+def test_cli_writes_the_attempts_left_and_a_memory_folder_relative_to_the_run_directory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    stdout, run_dir = run_two_rounds(monkeypatch, capsys, tmp_path)
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    # The memory folder is recorded relative to the run directory, and no value of the file is a path of this machine.
+    assert config["memory_dir"] == "memory"
+    assert not [value for value in config.values() if isinstance(value, str) and Path(value).is_absolute()]
+    # The attacker is never given a turn, so its budget of three attempts stays whole, in the file and in the CSV the command prints.
+    assert column([RoundRecord(**line) for line in read_jsonl(run_dir / "rounds.jsonl")], "attempts_left") == [3, 3]
+    assert [row["attempts_left"] for row in csv.DictReader(stdout.splitlines())] == ["3", "3"]
 
 
 def test_cli_names_the_run_folder_without_the_colon_of_an_llm_detector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -356,3 +383,23 @@ def test_cli_memory_dir_carries_the_agents_memories_from_one_run_to_the_next(
     # Reading the defender's ledger as a third run would load it: one cost record per round of the two runs.
     assert [record.sequence for record in agents.defender([], memory_dir=memory_dir).cost_history] == [1, 2]
     assert not list((tmp_path / "results").glob("*/memory"))
+    # The folder lies beside the results folder, so `config.json` names it by its path from the run directory.
+    configs = [json.loads(path.read_text(encoding="utf-8")) for path in (tmp_path / "results").glob("adv_*/config.json")]
+    assert {config["memory_dir"] for config in configs} == {"../../memory"}
+
+
+@pytest.mark.parametrize(
+    ("memory", "recorded"),
+    [("results/adv_x/memory", "memory"), ("results/adv_x/deeper/mem", "deeper/mem"), ("mem", "../../mem")],
+)
+def test_memory_folder_is_recorded_relative_to_the_run_directory(tmp_path: Path, memory: str, recorded: str) -> None:
+    assert relative_memory_dir(tmp_path / memory, tmp_path / "results" / "adv_x") == recorded
+
+
+def test_memory_folder_with_no_relative_path_is_recorded_by_its_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def other_drive(path: Path, _start: Path) -> str:
+        raise ValueError(f"path is on mount 'C:', start on mount 'D:': {path}")
+
+    # Making `os.path.relpath` fail as it does between two Windows drives, where no relative path exists.
+    monkeypatch.setattr(os.path, "relpath", other_drive)
+    assert relative_memory_dir(tmp_path / "agents" / "mem", tmp_path / "run") == "mem"
