@@ -1,195 +1,270 @@
-<img src="docs/banner.svg" alt="Jev IDS banner showing the jev_ids terminal lockup, the tagline &quot;Intrusion detection with a System One Model, on a stream of flows whose labels come back late.&quot;, and the command that streams CIC-IDS2017 through the full system" width="100%" />
+<img src="docs/banner.svg" alt="Banner do Jev IDS mostrando o logotipo jev_ids no terminal, a frase 'Detecção de intrusões com um System One Model, em um fluxo contínuo de conexões cujos rótulos chegam com atraso', e o comando que executa o CIC-IDS2017 pelo sistema completo" width="100%" />
 
 # Jev IDS
 
-![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-0B6B3A?style=flat&labelColor=121917) ![Detector Jev, from TypeSafe](https://img.shields.io/badge/detector-Jev%20%28TypeSafe%29-0B6B3A?style=flat&labelColor=121917) ![Datasets CIC-IDS2017 and NSL-KDD](https://img.shields.io/badge/datasets-CIC--IDS2017%20%C2%B7%20NSL--KDD-0B6B3A?style=flat&labelColor=121917) ![License MIT](https://img.shields.io/badge/license-MIT-0B6B3A?style=flat&labelColor=121917)
+![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-0B6B3A?style=flat&labelColor=121917) ![Detector Jev, da TypeSafe](https://img.shields.io/badge/detector-Jev%20%28TypeSafe%29-0B6B3A?style=flat&labelColor=121917) ![Datasets CIC-IDS2017 e NSL-KDD](https://img.shields.io/badge/datasets-CIC--IDS2017%20%C2%B7%20NSL--KDD-0B6B3A?style=flat&labelColor=121917) ![Licença MIT](https://img.shields.io/badge/license-MIT-0B6B3A?style=flat&labelColor=121917)
 
-**Intrusion detection on a stream of network flows. For each flow, Jev IDS picks a few labeled flows from what it has already seen and shows them to [TypeSafe's Jev](https://docs.typesafe.ai/introduction) in one request. Jev answers whether the flow is an attack and which kind, in under a quarter of a second, with no text to parse.**
+**Detecção de intrusões em um fluxo contínuo de conexões de rede — estendida com um laço adversarial fechado em Agno (NSL-KDD / Unipampa) e suporte ao Gemini Decision. A cada fluxo, o Jev IDS seleciona alguns registros já rotulados e os envia em uma única requisição a um modelo de decisão ([Jev da TypeSafe](https://docs.typesafe.ai/introduction) ou Gemini Decision), respondendo se há ataque e qual a categoria, sem texto livre para parsear.**
 
-An intrusion detection system (IDS) watches the traffic of a network and raises an alarm when it suspects an attack. Jev IDS does this by showing an AI model, Jev, a few flows whose category is already known and asking it to judge the new one. Two components decide what Jev sees. The KController decides how many examples of each kind of traffic to show, and the Selector decides which ones. In a real network the confirmation that a flow was an attack arrives late, so Jev IDS was measured on CIC-IDS2017, a public benchmark of network attacks, with that confirmation arriving 1 to 200 flows later. With the confirmation one flow late, Jev IDS and the strongest classical detector tested, a Random Forest, are level. From a delay of 25 flows on, each of the three runs of Jev IDS scored a higher F1 than every classical detector, and the lead grows with the delay. Most of the lead comes from zero-day attacks, the ones the system had never seen. With a delay of 200 flows, Jev IDS caught 54% of them and the Random Forest 29%.
+Um sistema de detecção de intrusões (IDS) monitora o tráfego de uma rede e dispara um alerta quando suspeita de ataque. O Jev IDS faz isso mostrando ao modelo de IA **Jev** alguns fluxos cuja categoria já é conhecida e pedindo que julgue o novo registro. Dois componentes escolhem o que o Jev vê: o **KController** define quantos exemplos de cada tipo de tráfego mostrar, e o **Selector** escolhe quais deles enviar. Em uma rede real, a confirmação de que um fluxo foi ataque chega com atraso; por isso o Jev IDS foi avaliado no CIC-IDS2017, um benchmark público de ataques de rede, com essa confirmação chegando de 1 a 200 fluxos depois. Com atraso de 1 fluxo, o Jev IDS e o detector clássico mais forte testado (Random Forest) ficam empatados. A partir de um atraso de 25 fluxos, todas as três execuções do Jev IDS obtiveram F1 maior que qualquer detector clássico, e a vantagem cresce com o atraso — principalmente em ataques zero-day nunca vistos antes. Com atraso de 200 fluxos, o Jev IDS capturou 54% deles contra 29% do Random Forest.
 
-[Read the loop](jev_ids/stream.py) · [The request template](prompts/cicids2017/jev.json) · [Design log](docs/jevids-design.md) · [Glossary](CONTEXT.md)
+[Ler o laço de stream](jev_ids/stream.py) · [O laço adversarial](jev_ids/adversarial.py) · [Template da requisição](prompts/cicids2017/jev.json) · [Dashboard HTML](docs/dashboard.html) · [Registro de design](docs/jevids-design.md) · [Glossário](CONTEXT.md)
 
-## The problem
+## O problema
 
-A flow is the summary of one conversation between two computers. It records how many packets and bytes went each way, how long the conversation lasted, which port it used and dozens of other measures. In CIC-IDS2017, the dataset used here, each line is one flow, described by 83 columns of measures and by a label that says whether it is normal traffic or which attack it belongs to.
+Um fluxo (*flow*) é o resumo de uma conversa entre dois computadores. Ele registra quantos pacotes e bytes trafegaram em cada direção, quanto tempo a conexão durou, qual porta foi usada e dezenas de outras medidas. No CIC-IDS2017, cada linha é um fluxo descrito por 83 colunas de atributos e por um rótulo indicando se é tráfego normal ou a qual ataque pertence.
 
-An IDS receives each flow and decides whether it is benign traffic or part of an attack. When it decides attack, it raises an alarm.
+Um IDS recebe cada fluxo e decide se é tráfego legítimo (*benigno*) ou parte de um ataque. Quando decide ataque, emite um alerta.
 
-Two facts make the task hard. The first is that attacks appear that the system has never seen, the zero-day attacks defined below. A detector that learned only from older examples tends to take a zero-day attack for normal traffic. The second is that the right answer arrives late. A security analyst confirms that a flow was an attack only some time later, when the damage shows or someone investigates. Until then the system keeps judging new flows without knowing whether it got the earlier ones right.
+Dois fatores tornam a tarefa difícil. O primeiro é o surgimento de ataques que o sistema nunca viu — os **ataques zero-day** definidos abaixo. Um detector que aprendeu apenas com exemplos antigos tende a classificar um ataque zero-day como tráfego normal. O segundo é que a resposta correta chega atrasada: um analista de segurança só confirma que um fluxo foi ataque algum tempo depois, quando o impacto aparece ou alguém investiga. Até lá, o sistema continua julgando novos fluxos sem saber se acertou os anteriores.
 
-> **Zero-day attack.** In network security, a zero-day attack is one the defenders do not yet know when it happens, so they had zero days to prepare. Here, the zero-day attacks are the three attack names of the test that never appear in the system's starting memory ([How it was tested](#how-it-was-tested)). The system meets them for the first time during the test, with no example of them.
+> **Ataque zero-day.** Em segurança de redes, um ataque zero-day é um ataque que os defensores ainda não conhecem quando ocorre, tendo tido zero dias para se preparar. Aqui, os ataques zero-day são os três nomes de ataque do conjunto de teste que nunca aparecem na memória inicial do sistema ([Como foi testado](#como-foi-testado)). O sistema os encontra pela primeira vez durante o teste, sem nenhum exemplo prévio deles.
 
-This delay is called D and is counted in flows. With D = 1, the label of a flow comes back just before the next flow is judged. With D = 200, it comes back only after 200 more flows have been judged.
+Esse atraso é chamado de **D** e é medido em quantidade de fluxos. Com D = 1, o rótulo de um fluxo volta logo antes de o próximo fluxo ser julgado. Com D = 200, só retorna depois que outros 200 fluxos já foram julgados.
 
-## How it works
+## Como funciona
 
-Jev is an AI model from TypeSafe, of a kind called a System One Model. It reads a `state`, a block of information, and answers typed questions about it with probabilities, so there is no generated text to parse. Jev IDS puts into the state the instructions, the 83 column names, a description of each category, a few flows whose category is already known (the examples) and the flow to judge. Then it asks two questions. `is_attack` comes back as a probability from 0 to 1, called p_attack. `category` comes back as one of six categories with a confidence. The categories are benign traffic (`BENIGN`) and five families of attack, listed in [How it was tested](#how-it-was-tested).
+O Jev é um modelo de IA da TypeSafe, de um tipo chamado *System One Model*. Ele lê um `state` (bloco de informações) e responde perguntas tipadas sobre esse estado com probabilidades, sem gerar texto livre para ser interpretado. O Jev IDS coloca no `state` as instruções, os nomes das 83 colunas, uma descrição de cada categoria, alguns fluxos cuja categoria já é conhecida (os exemplos) e o fluxo sob teste. Em seguida faz duas perguntas: `is_attack` retorna uma probabilidade entre 0 e 1 chamada `p_attack`; `category` retorna uma entre seis categorias com um valor de confiança. As categorias são tráfego benigno (`BENIGN`) e cinco famílias de ataque listadas em [Como foi testado](#como-foi-testado).
 
-<img src="docs/verdict.svg" alt="One flow, two typed answers. is_attack, a noul question, returns 0.80, above the 0.58 cut, so the verdict is attack. category, a choice question, returns DoS with confidence 0.89. The flow is the first of a zero-day DoS Slowhttptest burst" width="100%" />
+<img src="docs/verdict.svg" alt="Um fluxo, duas respostas tipadas. is_attack, uma pergunta noul, retorna 0,80, acima do corte de 0,58, portanto o veredito é ataque. category, uma pergunta choice, retorna DoS com confiança 0,89. O fluxo é o primeiro de uma rajada zero-day de DoS Slowhttptest" width="100%" />
 
-The figure shows one real flow of the test, the first flow of the zero-day attack `DoS Slowhttptest`, as Jev answered it with D = 200. The top bar is p_attack, 0.80, which is above the cut of 0.58, so the verdict is attack. The lower bar splits the probability among the six categories, with 0.91 of it on DoS, and the confidence of 0.89 says how concentrated that split is.
+A figura mostra um fluxo real do teste — o primeiro fluxo do ataque zero-day `DoS Slowhttptest`, respondido pelo Jev com D = 200. A barra superior mostra `p_attack` = 0,80, acima do limiar de corte 0,58, gerando alerta de ataque. A barra inferior distribui a probabilidade entre as seis categorias, com 0,91 concentrados em DoS e confiança de 0,89.
 
-Around that request runs a loop over the stream of flows. The figure below draws it, and the six steps after it follow one flow through it.
+Ao redor dessa requisição roda um laço sobre o fluxo contínuo de conexões. A figura abaixo ilustra o fluxo de execução e os seis passos seguintes acompanham um registro por ele.
 
-<img src="docs/stream.svg" alt="The Jev IDS loop. The memory holds the pool flows that ended before the flow under test and the judged flows whose label came back. The KController sets k per category and the Selector picks the examples, written as compact records. One request goes to Jev, whose p_attack becomes the verdict at 0.58, and the true label returns D flows later to the memory and the KController" width="100%" />
+<img src="docs/stream.svg" alt="O laço do Jev IDS. A memória guarda os fluxos do pool encerrados antes do fluxo em teste e os fluxos já julgados cujo rótulo retornou. O KController define k por categoria e o Selector escolhe os exemplos em formato compacto. Uma requisição vai para o Jev, cujo p_attack gera o veredito em 0,58, e o rótulo verdadeiro volta D fluxos depois para a memória e o KController" width="100%" />
 
-The top row is one step. The flow under test goes to Jev in one request, and the answer becomes a verdict and one row of results. The bottom row is what Jev IDS adds around Jev. The memory feeds the KController and the Selector, which choose the examples that go into the request. The dashed line is the label of each judged flow, which comes back D flows later to the memory and to the KController.
+A linha superior representa um passo: o fluxo em teste vai para o Jev em uma requisição, e a resposta gera o veredito e uma linha de resultado. A linha inferior mostra o que o Jev IDS acrescenta ao redor do Jev: a memória alimenta o KController e o Selector, que escolhem os exemplos enviados na requisição. A linha tracejada indica o rótulo verdadeiro de cada fluxo julgado, que retorna D fluxos depois para a memória e para o KController.
 
-The memory holds the labeled flows a step may draw examples from. These are the flows of the pool, prepared before the test, that ended before the flow under test, and every judged flow whose label has come back.
+A memória armazena os fluxos rotulados disponíveis para seleção de exemplos: os fluxos do *pool* (preparado antes do teste) encerrados antes do fluxo atual e todos os fluxos já julgados cujo rótulo retornou.
 
-1. **The flow arrives.** CIC-IDS2017 was recorded by a tool that writes a line when each connection ends, so a real IDS receives a flow only once it has ended. Jev IDS sorts the test flows by the moment each one ended, its start time plus its duration, and judges them one at a time in that order. Each step therefore uses only information that would already have existed at that moment.
-2. **The KController decides how many examples.** It keeps one number k for each category. Before each judgement, Jev receives k examples of each category, rounded up. Every k starts at 1.
-3. **The Selector decides which examples.** Within each category of the memory, it prefers the flows most similar to the flow under test, the most recent ones and the ones Jev was unsure about. It then picks among them by maximal marginal relevance (MMR), which passes over near-duplicates, so the examples show varied cases. Last, it adds the benign flow nearest to the flow under test when the pick left it out, so Jev always sees the normal traffic closest to it. This last step is called the nearest benign flow.
-4. **The compact record shortens the text.** Each decimal value reaches Jev with 4 significant digits, so 25160.418 becomes 25160. Integers such as ports stay as they are, and every column is kept. Text is counted in tokens, pieces of a few letters each, and Jev charges for the tokens it reads, so the compact record saves 21% to 25% of the tokens, and of the cost, with no loss in F1.
-5. **Jev answers and Jev IDS decides.** Jev returns p_attack, and Jev IDS raises the alarm when p_attack is at least 0.58. That cut was taken before the test on the `validation` split, a separate stream of 300 flows, and the test flows never tuned it.
-6. **The label comes back D flows later.** The judged flow enters the memory with its true category and can serve as an example from then on. The KController compares the true category with the one Jev named. When Jev was wrong, the k of the true category doubles, up to 8. When Jev was right, that k falls by 1/k, down to 1 at the least. Jev IDS thus shows more examples of the categories it gets wrong and spends fewer tokens on the ones it already handles. Every label comes back, missed attacks included.
+1. **O fluxo chega.** O CIC-IDS2017 foi gravado registrando cada conexão no encerramento, então um IDS real só recebe um fluxo quando ele termina. O Jev IDS ordena os fluxos de teste pelo instante de término (início + duração) e os julga um por vez nessa ordem, usando apenas informação que já existiria naquele momento.
+2. **O KController decide quantos exemplos enviar.** Ele mantém um valor `k` para cada categoria. Antes de cada julgamento, o Jev recebe `k` exemplos de cada categoria (arredondado para cima). Todos começam em `k = 1`.
+3. **O Selector escolhe os exemplos.** Dentro de cada categoria na memória, prioriza os fluxos mais parecidos com o fluxo atual, os mais recentes e aqueles sobre os quais o modelo teve menor certeza. Depois aplica *Maximal Marginal Relevance (MMR)* para evitar quase-duplicatas e mostrar casos variados. Por fim, garante que o fluxo benigno mais próximo esteja incluído (*nearest benign flow*), para o Jev sempre enxergar o tráfego normal mais próximo do registro avaliado.
+4. **O registro compacto encurta o texto.** Valores decimais vão ao Jev com 4 dígitos significativos (`25160.418` vira `25160`), enquanto inteiros (como portas) permanecem exatos e todas as colunas são mantidas. Isso economiza de 21% a 25% dos tokens (e do custo) sem perda de F1.
+5. **O Jev responde e o Jev IDS decide.** O Jev devolve `p_attack`, e o Jev IDS emite alerta quando `p_attack >= 0,58` no benchmark CIC-IDS2017 (corte definido antes do teste no split `validation` de 300 fluxos; o padrão geral em `records.py` e no estudo NSL-KDD é `0,5`).
+6. **O rótulo volta D fluxos depois.** O fluxo julgado entra na memória com sua categoria verdadeira e passa a servir de exemplo. O KController compara a categoria verdadeira com a predita: quando há erro, o `k` da categoria verdadeira dobra (até 8); quando há acerto, cai em `1/k` (até o mínimo de 1). Assim, o sistema mostra mais exemplos das categorias em que erra e economiza tokens nas que já domina.
 
-The KController's rule mirrors the one TCP uses against congestion on the internet (AIMD), which grows the sending window slowly and halves it on a loss. In an IDS the costly mistake is showing too few examples, so the KController grows k fast after an error and shrinks it slowly after a success.
+A regra do KController espelha o algoritmo AIMD usado pelo TCP para controle de congestionamento (crescimento aditivo, redução multiplicativa invertida para priorizar cobertura após erros).
 
-The whole request is one file, [`prompts/cicids2017/jev.json`](prompts/cicids2017/jev.json). Python adds only the flow and the examples, and the file's sha256 travels in every prediction row as `prompt_hash`, so runs that asked different things are never compared as equals. Examples are labeled by category only, and attack names such as `DoS Hulk` never reach a model.
+A requisição inteira fica em [`prompts/cicids2017/jev.json`](prompts/cicids2017/jev.json). O Python preenche apenas o fluxo em análise e os exemplos selecionados, gravando o SHA-256 do prompt como `prompt_hash` em cada linha de predição. Os exemplos recebem apenas a categoria geral — nomes específicos de ataques como `DoS Hulk` nunca chegam ao modelo.
 
-<img src="docs/request.svg" alt="The flow under test and the examples the Selector chose go into one request to Jev, whose state holds instructions, columns, categories, examples and the flow, with two typed questions. The answers come back as p_attack 0.80, verdict attack at the 0.58 cut, and category DoS with confidence 0.89" width="100%" />
+<img src="docs/request.svg" alt="O fluxo em teste e os exemplos escolhidos pelo Selector entram em uma requisição ao Jev, com estado contendo instruções, colunas, categorias, exemplos e fluxo, e duas perguntas tipadas (noul e choice)" width="100%" />
 
-On the left are the inputs, the flow under test as a compact record and the examples the Selector chose. In the middle is the request, whose state holds the instructions, the columns, the categories, the examples and the flow, and whose two questions are typed `noul` (a probability) and `choice` (one option with a confidence). On the right are the two answers.
+## Como foi testado
 
-## How it was tested
+### Os dados
 
-### The data
+O benchmark principal utiliza o CIC-IDS2017 re-rotulado por Liu et al. (IEEE CNS 2022), publicado pelo grupo DistriNet da KU Leuven. Trata-se de tráfego público capturado em rede de laboratório durante cinco dias úteis (3 a 7 de julho de 2017). O script [`scripts/prepare_cicids2017.py`](scripts/prepare_cicids2017.py) ordena os fluxos de cada dia cronologicamente e divide em duas metades: a primeira metade compõe o *pool* inicial (até 50.000 fluxos benignos e 10.000 por ataque, totalizando 88.066 fluxos), e a segunda metade forma a base de teste (19.368 fluxos, dos quais 2.000 formam o split `paper-v2`: 1.020 benignos e 980 ataques).
 
-The test uses the relabelled CIC-IDS2017 of Liu et al. (IEEE CNS 2022), published by the DistriNet group of KU Leuven. CIC-IDS2017 is public traffic recorded on a lab network over five weekdays, 3 to 7 July 2017, with attacks run by researchers. [`scripts/prepare_cicids2017.py`](scripts/prepare_cicids2017.py) sorts the flows of each label on each day by time and splits them in two halves. The earlier half may become examples, and the later half may be judged. The pool, the memory at the start of the test, is a seeded sample of the earlier half with at most 50,000 benign flows and 10,000 flows per attack name, 88,066 flows in all. The later half, sampled the same way with at most 10,000 benign flows and 1,000 per attack name, holds 19,368 flows. The 2,000 test flows of the `paper-v2` split were drawn from it, 1,020 benign and 980 attacks.
+### As categorias
 
-### The categories
+| Categoria  | Significado no tráfego                                                         | Nomes de ataque no teste e suas quantidades                                                 |
+| ---------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| BENIGN     | Tráfego normal                                                                 | 1.020 fluxos                                                                                |
+| DoS        | Negação de serviço por um único host tentando derrubar ou travar um servidor   | `DoS Slowloris` 101, `DoS Slowhttptest` 117 (zero-day), `DoS Hulk` 114, `DoS GoldenEye` 118 |
+| DDoS       | Negação de serviço distribuída, partindo de várias máquinas ao mesmo tempo     | `DDoS` 87                                                                                   |
+| PortScan   | Varredura de portas em uma máquina buscando serviços abertos                   | `Portscan` 106, `Infiltration - Portscan` 89 (zero-day)                                     |
+| BruteForce | Tentativa e erro para adivinhar senhas                                         | `FTP-Patator` 114, `SSH-Patator` 87 (zero-day)                                              |
+| Botnet     | Tráfego de máquinas infectadas obedecendo a um servidor de comando e controle  | `Botnet` 47                                                                                 |
 
-| Category   | What the traffic is                                                         | Attack names in the test, with their flows                                                  |
-| ---------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| BENIGN     | Normal traffic                                                              | 1,020 flows                                                                                 |
-| DoS        | Denial of service, an attempt to bring a server down with too many requests | `DoS Slowloris` 101, `DoS Slowhttptest` 117 (zero-day), `DoS Hulk` 114, `DoS GoldenEye` 118 |
-| DDoS       | The same attack, from many machines at once                                 | `DDoS` 87                                                                                   |
-| PortScan   | A sweep of a machine's ports in search of open services                     | `Portscan` 106, `Infiltration - Portscan` 89 (zero-day)                                     |
-| BruteForce | Guessing passwords by trial and error                                       | `FTP-Patator` 114, `SSH-Patator` 87 (zero-day)                                              |
-| Botnet     | Traffic of infected machines that obey a remote controller                  | `Botnet` 47                                                                                 |
+### Os ataques zero-day
 
-### The zero-day attacks
+Três nomes de ataque nunca aparecem no *pool* inicial: `SSH-Patator` (BruteForce), `DoS Slowhttptest` (DoS) e `Infiltration - Portscan` (PortScan). Suas categorias gerais continuam presentes no *pool* por meio dos outros ataques conhecidos, permitindo avaliar a capacidade de generalização em 293 fluxos desconhecidos.
 
-Three attack names never appear in the pool, so every detector meets them for the first time during the test. `SSH-Patator` guesses the passwords of remote logins (BruteForce). `DoS Slowhttptest` brings a web server down with very slow requests (DoS). `Infiltration - Portscan` is a port sweep run from inside the network by a machine already broken into (PortScan). Their categories stay in the pool through the other attack names, so Jev can still be shown examples of DoS, BruteForce and PortScan. Together they hold 293 flows, and those flows measure what matters most, the reaction to an unknown attack.
+Cada ataque chega em uma rajada (*burst*) entre 116 e 171 fluxos. Atrasos `D = 1, 25, 50, 100` são menores que a menor rajada; já com `D = 200`, nenhum rótulo de um ataque zero-day retorna antes do fim da rajada, forçando o detector a reconhecê-lo sem nunca ter visto exemplos daquela assinatura.
 
-Each attack name arrives in one burst, a stretch of the stream where its flows come close together, mixed with benign flows. The three zero-day bursts span 116 to 171 flows. D = 1, 25, 50 and 100 are all shorter than the shortest burst, so some labels of a zero-day attack come back while its burst still lasts. D = 200 is longer than the longest burst, so no label of a zero-day attack comes back before its burst ends, and each detector has to recognise the attack without having seen it.
+### Os detectores comparados
 
-### The detectors compared
+- **Random Forest** (scikit-learn, 100 árvores): detecção supervisionada treinada sobre os exemplos rotulados disponíveis na memória.
+- **kNN** (4 vizinhos): vota pela maioria dos fluxos mais próximos na memória usando a mesma distância do Selector.
+- **Isolation Forest** (scikit-learn, 100 árvores): detecção de anomalias treinada apenas com o tráfego benigno disponível na memória.
 
-Jev IDS is compared with three classical detectors, each a different way of detecting intrusions.
+Os três modelos clássicos são re-treinados a cada passo exatamente sobre a mesma memória conhecida pelo Jev IDS no instante `t`, com corte de alerta padrão `p_attack >= 0,5`.
 
-- **Random Forest** (scikit-learn, 100 trees) is supervised detection, which learns from labeled examples of every category. It was the strongest classical detector in this test.
-- **kNN** (4 neighbours) takes the flows of the memory nearest to the flow under test, in the same distance the Selector uses, and follows the category of the majority, with no call to Jev. It tests whether Jev adds anything beyond finding similar flows.
-- **Isolation Forest** (scikit-learn, 100 trees) is anomaly detection, which learns only what benign traffic looks like and flags what departs from it. It needs no example of an attack, which makes it the natural rival on zero-day attacks.
+### Quantas execuções
 
-The three are refitted at every step on the same memory as Jev IDS, the Isolation Forest on its benign flows alone. At each judgement they know exactly what Jev IDS knows at that moment. A model trained once before the test would miss the labels that come back during it, which would favour Jev IDS. A model trained once on all the data would see flows from the future, which would favour the classical detector. Refitting at every step avoids both. The classical detectors raise the alarm at p_attack ≥ 0.5, their usual cut.
+Como o Jev pode apresentar pequena variação entre chamadas repetidas, o sistema completo rodou três vezes por atraso `D`. Os detectores clássicos usam sementes fixas e rodaram uma vez cada.
 
-### How many runs
+## O que os números significam
 
-Jev can answer slightly differently when it gets the same question twice, so the full system ran three times at each D. The classical detectors use fixed seeds and give the same answers every time, so each ran once. The tables give the mean of the three runs of Jev IDS unless they name a run.
+- **Recall:** fração dos 980 ataques (conhecidos + zero-day) que gerou alerta. Quanto maior, melhor.
+- **Recall zero-day:** fração dos 293 fluxos zero-day que gerou alerta. Quanto maior, melhor.
+- **Falsos alarmes:** quantidade de fluxos benignos (entre 1.020) que gerou alerta indevido. Quanto menor, melhor.
+- **F1:** média harmônica entre precisão e recall: `2 × acertos / (2 × acertos + falsos alarmes + ataques perdidos)`.
+- **Teste pareado:** teste exato de sinais de McNemar focado apenas nos fluxos em que dois detectores discordam, com correção de Holm para múltiplas comparações (`p < 0,05` indica diferença estatisticamente significativa).
 
-## What the numbers mean
+## Evidências e limites
 
-Every judged flow falls into one of four cases. An attack with an alarm is a hit. An attack without an alarm is a missed attack. A benign flow with an alarm is a false alarm. A benign flow without an alarm is a correct silence. The measures below combine these four counts.
+No split `paper-v2` do CIC-IDS2017 (2.000 fluxos em ordem temporal), as execuções de 2026-11-02 em [`results/design-cicids2017/`](results/design-cicids2017) e documentadas em [`docs/jevids-design.md`](docs/jevids-design.md) mostram:
 
-- **Recall** is the share of the 980 attacks that raised an alarm, known and zero-day together. Higher is better.
-- **Zero-day recall** is the same share over the 293 zero-day flows alone. Higher is better.
-- **False alarms** count the benign flows, out of 1,020, that raised an alarm. Lower is better, because each one costs an analyst time.
-- **F1** joins the two goals, catching attacks and avoiding false alarms, in one number from 0 to 1 that is high only when both are good. It is 2 × hits divided by (2 × hits + false alarms + missed attacks). Higher is better.
-- **The paired test** says whether a difference between two detectors is real or could be luck. It looks only at the flows where the two disagree, the ones only one of them got right. If the two were equally good, those flows would split half and half, like a coin. The exact sign test gives p, the chance of a split at least as uneven as the one observed if both were equally good, and below 0.05 the difference counts as real. Holm's correction raises each p to account for the three comparisons made for each pair of detectors, on all flows, on known attacks and on zero-day attacks.
+| D   | Jev IDS F1    | Random Forest F1 | kNN F1 | Isolation Forest F1 | Jev IDS recall zero-day | Random Forest recall zero-day | Falsos alarmes Jev IDS / 1.020 | Falsos alarmes RF / 1.020 |
+| --- | ------------- | ---------------- | ------ | ------------------- | ----------------------- | ----------------------------- | ------------------------------ | ------------------------- |
+| 1   | 0.984 ± 0.001 | 0.988            | 0.983  | 0.495               | 0.953                   | 0.945                         | 1 a 2                          | 1                         |
+| 25  | 0.975 ± 0.002 | 0.961            | 0.951  | 0.494               | 0.883                   | 0.799                         | 2                              | 0                         |
+| 50  | 0.969 ± 0.001 | 0.947            | 0.934  | 0.494               | 0.861                   | 0.713                         | 3 a 6                          | 0                         |
+| 100 | 0.954 ± 0.004 | 0.906            | 0.898  | 0.495               | 0.721                   | 0.471                         | 2 a 4                          | 0                         |
+| 200 | 0.923 ± 0.001 | 0.873            | 0.869  | 0.495               | 0.540                   | 0.294                         | 3                              | 0                         |
 
-## Evidence and limits
+Com `D = 1`, Jev IDS e Random Forest empatam. À medida que `D` cresce, o Random Forest cai rapidamente em zero-day enquanto o Jev IDS sustenta generalização a partir das famílias conhecidas (`+0,050` de F1 e `54%` vs `29%` de recall zero-day em `D = 200`). O Isolation Forest ignora rótulos que chegam depois e permanece estável próximo de `0,495` F1 com 75–77 falsos alarmes.
 
-The `paper-v2` split of CIC-IDS2017 holds 2,000 flows in the order they ended, 1,020 benign and 980 attacks, 293 of those zero-day. It was drawn from rows no earlier split held and read once. The runs of 2026-11-02 are in [`results/design-cicids2017/`](results/design-cicids2017), and [`docs/jevids-design.md`](docs/jevids-design.md) reads each one next to its stamp.
+<img src="docs/results-cicids2017.svg" alt="Gráficos de F1 e recall zero-day pelo atraso de feedback D no split paper-v2 do CIC-IDS2017" width="100%" />
 
-| D   | Jev IDS F1    | Random Forest F1 | kNN F1 | Isolation Forest F1 | Jev IDS zero-day recall | Random Forest zero-day recall | Jev IDS false alarms / 1,020 | Random Forest false alarms / 1,020 |
-| --- | ------------- | ---------------- | ------ | ------------------- | ----------------------- | ----------------------------- | ---------------------------- | ---------------------------------- |
-| 1   | 0.984 ± 0.001 | 0.988            | 0.983  | 0.495               | 0.953                   | 0.945                         | 1 to 2                       | 1                                  |
-| 25  | 0.975 ± 0.002 | 0.961            | 0.951  | 0.494               | 0.883                   | 0.799                         | 2                            | 0                                  |
-| 50  | 0.969 ± 0.001 | 0.947            | 0.934  | 0.494               | 0.861                   | 0.713                         | 3 to 6                       | 0                                  |
-| 100 | 0.954 ± 0.004 | 0.906            | 0.898  | 0.495               | 0.721                   | 0.471                         | 2 to 4                       | 0                                  |
-| 200 | 0.923 ± 0.001 | 0.873            | 0.869  | 0.495               | 0.540                   | 0.294                         | 3                            | 0                                  |
+### O que cada parte acrescenta
 
-Each row is one delay D. The F1 of Jev IDS is the mean of its three runs followed by their standard deviation, and its false alarms are the range over the three runs. Each classical detector ran once.
+Estudo de ablação em `D = 1, 50 e 200`:
 
-With D = 1, Jev IDS and the Random Forest are level. Both learn almost at once from labels that come back one flow later, and the forest's slightly higher F1, 0.988 against 0.984, is a difference the paired test does not confirm. As D grows, the Random Forest falls fast, above all on zero-day attacks. Jev IDS falls more slowly, because Jev can judge an attack it has never seen from examples of the known ones. At D = 200 the F1 of Jev IDS is 0.050 above the forest's, and it catches 54% of the zero-day flows against 29%.
+| Configuração          | O que muda                                   | F1 em D = 1 / 50 / 200 | Falsos alarmes | Tokens por fluxo      |
+| --------------------- | -------------------------------------------- | ---------------------- | -------------- | --------------------- |
+| Sistema completo      | nada                                         | 0.985 / 0.970 / 0.925  | 2 / 5 / 3      | 3.029 / 2.984 / 3.096 |
+| Sem Selector          | exemplos sorteados aleatoriamente na memória | 0.925 / 0.935 / 0.886  | 69 / 65 / 58   | 3.510 / 3.490 / 3.692 |
+| `k` fixo = 1          | sem KController, 1 exemplo por categoria     | 0.978 / 0.962 / 0.916  | 3 / 3 / 4      | 2.848 / 2.841 / 2.816 |
+| `k` fixo = 4          | sem KController, 4 exemplos por categoria    | 0.990 / 0.978 / 0.928  | 6 / 6 / 8      | 6.033 / 6.021 / 5.899 |
+| Registro completo     | valores exatos do CSV sem compactação        | 0.982 / 0.972 / 0.923  | 2 / 3 / 3      | 3.846 / 3.843 / 4.120 |
+| Aleatório, `k = 4`    | sem Selector, sem KController                | 0.957 / 0.955 / 0.927  | 75 / 73 / 69   | 5.410 / 5.388 / 5.322 |
+| Sem benigno próximo   | Selector sem âncora benigna mais próxima     | 0.979 / 0.971 / 0.929  | 27 / 29 / 22   | 3.300 / 3.339 / 3.351 |
 
-The Random Forest raises almost no false alarm, so the flows it loses are attacks it lets through. At D = 200 it misses all 87 flows of `SSH-Patator` and all 89 of `Infiltration - Portscan`, where the first run of Jev IDS catches 62 and 28. On `DoS Slowhttptest` at D = 200 the two forests do better than Jev IDS, with 96 of the 117 flows caught by the Isolation Forest, 86 by the Random Forest and 69 by the first run of Jev IDS. The Isolation Forest never uses the returning labels, so it stays the same at every D. It catches `DoS Slowhttptest` and neither of the other two zero-day attacks, finds about 35% of all attacks and raises 75 to 77 false alarms, which keeps its F1 near 0.49.
+O Selector é o componente de maior impacto para controlar falsos alarmes (caindo de 58–69 para 2–5 com o benigno mais próximo), e o registro compacto reduz 21–25% dos tokens mantendo o F1.
 
-<img src="docs/results-cicids2017.svg" alt="F1 and zero-day recall by feedback delay D on the CIC-IDS2017 paper-v2 split. Jev IDS stays above the Random Forest and the kNN from D = 25 on and its lead grows with D, and the Isolation Forest stays flat near 0.49 F1" width="100%" />
+### Limites importantes
 
-Panel (a) shows F1 and panel (b) zero-day recall, both against the delay D, with one line per detector, and higher is better in both. The delays are evenly spaced along the horizontal axis, so the step from 100 to 200 takes the same width as the step from 1 to 25.
+- Apenas o CIC-IDS2017 possui timestamps para stream; o NSL-KDD é avaliado em lote (*k-shot*) ou no laço adversarial abaixo.
+- A variação entre repetições do Jev pode chegar a `0,009` em F1 para um mesmo `D`.
+- O corte `0,58` foi ajustado no split `validation` do CIC-IDS2017 com margem estreita (`0,55` vs `0,58`); no estudo adversarial em NSL-KDD usa-se o limiar base `0,5`.
+- Na simulação de stream, todos os rótulos retornam após `D` fluxos; em operação real, analistas confirmam apenas uma fração do tráfego.
 
-Flow by flow, Jev IDS beats the Random Forest on zero-day attacks in every run from D = 25 on (adjusted p ≤ 0.042) and on all flows in every run from D = 50 on (adjusted p ≤ 0.0014). At D = 25 the win on all flows holds in two runs of three (adjusted p = 0.0055 and 0.027, against 0.056). At D = 1 no run differs from the forest on all flows, and in one run the forest is better on known attacks (16 flows against 4, adjusted p = 0.035). Longer delays add nothing past D = 200. At D = 250 and 500 the first run of Jev IDS scores an F1 of 0.929 and 0.920 and the forest 0.872 and 0.873, so the gap stops growing once the delay outlasts the bursts.
+## Por que é rápido e barato
 
-### What each part adds
+- **Uma requisição, duas respostas:** probabilidade `noul` e categoria `choice` na mesma chamada, sem parser frágil.
+- **Cobrança focada em entrada:** no Jev ($0,042 por milhão de tokens de entrada), 2.900–3.100 tokens/fluxo custam ~$121–$131 por milhão de vereditos (~0,22–0,24 s de mediana).
+- **Fail open:** chamadas com erro gravam `error` na linha e são contadas como ausência de alerta sem derrubar a execução.
 
-Each part of Jev IDS was removed or swapped in turn, one run each at D = 1, 50 and 200, and compared with the full system. This kind of test is called an ablation. The second column says what each line does differently.
+## Benchmark anterior: NSL-KDD
 
-| Line              | What changes                               | F1 at D = 1 / 50 / 200 | False alarms | Tokens per flow       |
-| ----------------- | ------------------------------------------ | ---------------------- | ------------ | --------------------- |
-| Full system       | nothing                                    | 0.985 / 0.970 / 0.925  | 2 / 5 / 3    | 3,029 / 2,984 / 3,096 |
-| No Selector       | examples drawn at random from the memory   | 0.925 / 0.935 / 0.886  | 69 / 65 / 58 | 3,510 / 3,490 / 3,692 |
-| Fixed k = 1       | no KController, one example per category   | 0.978 / 0.962 / 0.916  | 3 / 3 / 4    | 2,848 / 2,841 / 2,816 |
-| Fixed k = 4       | no KController, four examples per category | 0.990 / 0.978 / 0.928  | 6 / 6 / 8    | 6,033 / 6,021 / 5,899 |
-| Full record       | values as the CSV has them                 | 0.982 / 0.972 / 0.923  | 2 / 3 / 3    | 3,846 / 3,843 / 4,120 |
-| Random, k = 4     | no Selector, no KController                | 0.957 / 0.955 / 0.927  | 75 / 73 / 69 | 5,410 / 5,388 / 5,322 |
-| No nearest benign | the Selector without its benign anchor     | 0.979 / 0.971 / 0.929  | 27 / 29 / 22 | 3,300 / 3,339 / 3,351 |
+Antes do stream temporal, o Jev IDS foi avaliado no NSL-KDD em modo *k-shot* sem feedback contra Gemini 3.6 Flash, Random Forest e Isolation Forest (2.000 fluxos, 3 sementes, 2026-09-22). Em `k = 1`, o Jev foi 5,4× mais rápido que o LLM (0,31 s contra 1,65 s) e 22× mais barato ($74 contra $1.651 por milhão de fluxos), alcançando 74,7% contra 71,3% em zero-day (detalhes em [docs/results.md](docs/results.md) e [docs/protocol.md](docs/protocol.md)).
 
-The Selector matters most. Without it, Jev IDS loses on all flows at every D (adjusted p ≤ 8.7e-6) and raises 58 to 69 false alarms. With one example per category it loses on all flows at D = 1 (adjusted p = 0.007) and ties at D = 50 and 200, so the KController buys 0.7 to 0.8 points of F1 for 5% to 10% more tokens. Four examples per category tie with the full system at every D for twice the tokens. The full record ties at every D with 21% to 25% more tokens. Random examples lose at D = 1 and 50 and raise 69 to 75 false alarms. The nearest benign flow cuts the false alarms from 22 to 29 down to 2 to 5 and costs some zero-day flows at first contact. Jev itself adds something too. The kNN reads the same nearest flows without Jev, and in the first run the paired test finds no difference with it at D = 1 and a win for Jev IDS at every D from 25 on.
-
-### Limits worth knowing
-
-- One dataset carries the stream results. NSL-KDD has no timestamps, so it was measured as a k-shot benchmark only ([below](#earlier-benchmark-nsl-kdd)).
-- The full system ran three times at each D, and every other line once. The F1 of the full system varies by up to 0.009 between runs at one D, so a smaller gap between two ablation lines may come from the run alone.
-- The delays were chosen from the bursts of this same split.
-- The cut of 0.58 sits on a thin margin. On the validation stream, the highest benign p_attack was 0.55 and the lowest attack p_attack 0.58.
-- Every label comes back, missed attacks included. A real security team confirms only some of them.
-- Jev's latency is the wall clock of one successful call to TypeSafe's API and leaves out the Selector's own time. Jev's cost is TypeSafe's list price, not what was billed.
-- Jev's `noul` answer carries no confidence. Only the `choice` answer does.
-
-## Why it is fast and cheap
-
-- **One request, two answers.** Both questions run over the same state and come back as a probability, an option and a confidence. Nothing to parse, no schema to enforce.
-- **Input only.** Jev charges $0.042 per million input tokens and nothing for output. At 2,900 to 3,100 tokens per flow, a million verdicts cost $121 to $131, and the median call took 0.22 to 0.24 s.
-- **Few examples, chosen well.** The KController keeps k at 1 wherever Jev is right, and the Selector picks examples close to the flow. Drawing the examples at random instead raised the false alarms to 58 to 69 per 1,020 benign flows, against 2 to 5.
-- **Fail open.** A failed call becomes a row with `error`, counted as no alert. Never a crash.
-
-## Earlier benchmark: NSL-KDD
-
-Before the stream, Jev IDS was measured on NSL-KDD as a k-shot detector, with k labeled examples per category drawn at random and no feedback, against Gemini 3.6 Flash on Vertex AI, a Random Forest and an Isolation Forest (2,000 flows, three seeds, runs of 2026-09-22). At k = 1 Jev was 5.4 times faster than the LLM, with a median of 0.31 s against 1.65 s per flow, and 22 times cheaper, with $74 against $1,651 per million flows. It was as precise (0.953 against 0.942) and lower on F1 (0.856 against 0.880). On zero-day attacks it caught 74.7% against 71.3%, a difference the paired test confirms only at k = 1 and 2. The tables, figures and tests are in [docs/results.md](docs/results.md) and the protocol in [docs/protocol.md](docs/protocol.md).
-
-## Try it
+## Experimente
 
 ```bash
 git clone https://github.com/jev-sec/jev-ids.git
 cd jev-ids
 uv sync
-# .env holds TYPESAFE_API_KEY for Jev. Gemini needs `gcloud auth application-default login` and GOOGLE_GENAI_USE_VERTEXAI=true,
-# GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION=global in the environment. DEEPSEEK_API_KEY and CHATGPT_CLIENT_ID serve the other LLMs.
+# O .env guarda TYPESAFE_API_KEY para o Jev. O Gemini (llm:gemini) usa a Vertex AI: precisa de `gcloud auth application-default login`
+# e de GOOGLE_GENAI_USE_VERTEXAI=true, GOOGLE_CLOUD_PROJECT e GOOGLE_CLOUD_LOCATION=global no ambiente.
+# DEEPSEEK_API_KEY e CHATGPT_CLIENT_ID atendem os outros LLMs.
 ```
 
-Download `CICIDS2017_improved.zip` from the [relabelled version of Liu et al.](https://intrusion-detection.distrinet-research.be/CNS2022/Dataset_Download.html) into `data/raw/cicids2017/` and prepare it once. The committed splits need only the pool.
+### Benchmark CIC-IDS2017 (stream)
+
+Baixe `CICIDS2017_improved.zip` da [versão re-rotulada de Liu et al.](https://intrusion-detection.distrinet-research.be/CNS2022/Dataset_Download.html) em `data/raw/cicids2017/` e execute:
 
 ```bash
 uv run python -m scripts.prepare_cicids2017
 uv run jev-ids run --dataset data/cicids2017/dataset.json --detector jev --split smoke --delay 1 --k 1 --control aimd --selection score+nearest --seeds 0
 ```
 
-The script drops the "Attempted" flows and the attacks with too few flows to measure (the web attacks, Heartbleed and the 36 flows labeled plain Infiltration), splits each attack's flows of each day in time between the pool and the test file, and holds three attack names out of the pool as zero-day attacks. Its docstring gives every decision and [`SOURCE.json`](data/cicids2017/splits/SOURCE.json) the counts.
+### Benchmark NSL-KDD (k-shot estático)
 
-The smoke split is five flows. The run writes `results/<timestamp>-cicids2017-jev-smoke/` with `config.json`, one JSON row per flow in `predictions.jsonl` (the verdict, the truth, p_attack, the category, the confidence, the k of every category, the latency and the gateway's token report) and the raw answers in `responses.jsonl`.
-
-NSL-KDD has no timestamps, so it runs as a batch of k-shot requests with no stream. Download [NSL-KDD](https://www.kaggle.com/datasets/hassan06/nslkdd) into `data/raw/nsl-kdd/` and prepare it once.
+Os splits de NSL-KDD (`smoke`, `internal`, `pilot`, `mid`, `hard`, `paper`) já estão em `data/nsl-kdd/splits/`. Para gerar também o `pool.csv` completo (necessário quando `--k > 0`), baixe o [NSL-KDD](https://www.kaggle.com/datasets/hassan06/nslkdd) em `data/raw/nsl-kdd/` e execute:
 
 ```bash
 uv run python -m scripts.prepare_nsl_kdd
 uv run jev-ids run --dataset data/nsl-kdd/dataset.json --detector jev --split smoke --k 0,1
 ```
 
-## Compare detectors
+## Laço Adversarial Fechado (NSL-KDD — Unipampa)
+
+Extensão acadêmica controlada sobre o Jev IDS para estudar adaptação mútua em rodadas fechadas (`ação → resposta do detector → observação → adaptação`) entre dois agentes construídos com **Agno** (`Agent` + `LearningMachine` sobre um `SqliteDb` por lado, um arquivo que o outro lado nunca abre) e um orquestrador determinístico sem LLM (`Orchestrator`).
+
+- **Atacante (caixa-preta):** altera apenas uma nota de texto no campo `service` (índice `2` no NSL-KDD) dos registros de ataque. Observa somente contagens sobre os próprios registros: quantos foram respondidos (`attempts`), quantos geraram alerta (`alerts`) e quantos mudaram de lado desde a rodada anterior (`newly_alerted`, `newly_passing`). Não tem acesso a instruções do detector, probabilidades, gabarito, falsos alarmes ou métricas. Manter (`keep`) ou retirar (`remove`) a nota não custa nada; só uma redação nova gasta uma das `--max-attempts` tentativas.
+- **Defensor (adaptativo):** altera apenas as instruções enviadas ao detector (`B` básica, `R` reforçada declarando que valores de registro são dados não confiáveis, ou revisões que ele mesmo escreve), observando ataques detectados/que passaram, falsos alarmes em tráfego legítimo, chamadas que falharam, notas testadas e o custo de cada versão já medida. O rótulo de uma versão é derivado do texto pelo código (`B`, `R`, `V3`, `V4`, …) e o rótulo que o modelo escrever é ignorado; `keep` significa as instruções em vigor, qualquer que seja o texto devolvido. As notas testadas chegam ao modelo do defensor sempre entre `<untrusted_note>` e `</untrusted_note>`, declaradas como texto escrito pelo adversário e nunca como instrução.
+- **Detectores sob interface `DecisionDetector`:** `jev` (`jev-1.13.0`), `gemini_decision` (`gemini-decision-1` via `google-genai` `client.decisions.create`) e `llm:<provedor>`.
+- **Trajetória esperada:** `N/B → N/R → S/R → S/B → N′/B`. Registros legítimos (`normal`) nunca recebem nota.
+
+### Quem adapta a cada rodada
+
+A regra do orquestrador ([`jev_ids/turns.py`](jev_ids/turns.py)) é relativa à rodada anterior, porque um detector real costuma deixar passar parte dos ataques e pegar outra parte, e uma regra de tudo ou nada nunca daria a vez ao atacante. Sobre os registros de ataque respondidos nas duas rodadas, `newly_alerted` conta os que passavam e agora geram alerta, `newly_passing` os que geravam alerta e agora passam, e `net = newly_alerted − newly_passing`.
+
+| Situação                                                      | Quem recebe a vez | `why_adapted`          |
+| ------------------------------------------------------------- | ----------------- | ---------------------- |
+| Rodada 1: algum ataque passou                                 | defensor          | `attack_passed`        |
+| Rodada 1: todos os ataques respondidos geraram alerta         | atacante          | `attack_alerted`       |
+| `net > --noise-margin`                                        | atacante          | `attack_alerted`       |
+| `−net > --noise-margin` e a nota é a mesma da rodada anterior | atacante          | `regime_loosened`      |
+| Algum ataque passou                                           | defensor          | `attack_passed`        |
+| Nenhum dos casos acima                                        | defensor          | `defense_under_review` |
+
+Da rodada 2 em diante as linhas valem nessa ordem. Se o lado que recebeu a vez devolver a ação que já está em vigor (a mesma nota ou o mesmo texto de instruções), o outro lado é consultado uma vez; se ele também mantiver, o laço para com `stable`. O `rounds.jsonl` registra quem recebeu a vez (`turn`) e quem de fato adaptou (`who_adapts`).
+
+Duas regras de não repetição são verificadas pelo código, não deixadas a cargo do prompt. Uma redação que estava em vigor quando o atacante recebeu a vez por `attack_alerted` não pode ser submetida de novo (a comparação ignora maiúsculas e espaçamento). O defensor não pode voltar a uma versão já medida contra a mesma nota, a menos que o último custo dela contra essa nota (`ataques perdidos/ataques + falsos alarmes/benignos`) tenha sido menor que o custo recém-medido da versão em vigor. Uma proposta recusada volta ao modelo com o motivo, ele é consultado mais uma vez, e uma segunda recusa conta como manter.
+
+### 1. Instalar dependências e configurar o `.env`
+
+```bash
+uv sync
+```
+
+Crie `jev-ids/.env` (nunca versionado) apenas com as chaves dos modelos que for usar:
+
+```env
+TYPESAFE_API_KEY=...       # obrigatório para --detector jev
+GEMINI_API_KEY=...         # obrigatório para --detector gemini_decision (e fallback para hydrogen)
+ANTHROPIC_API_KEY=...      # obrigatório para --attacker/--defender claude (claude-sonnet-5-5)
+HYDROGEN_API_KEY=...       # opcional se diferente de GEMINI_API_KEY, para --attacker/--defender hydrogen (gemini-4-hydrogen)
+HYDROGEN_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+```
+
+O `llm:gemini` (e o agente `gemini`) não usa `GEMINI_API_KEY`: ele chama a Vertex AI com `gcloud auth application-default login` e com `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT` e `GOOGLE_CLOUD_LOCATION=global` no ambiente. O `gemini_decision` usa sempre a API Gemini com `GEMINI_API_KEY`, mesmo com `GOOGLE_GENAI_USE_VERTEXAI=true` definido. Sem nenhuma de `HYDROGEN_API_KEY`, `GEMINI_API_KEY` ou `GOOGLE_API_KEY`, o agente `hydrogen` recusa iniciar e nomeia as três variáveis.
+
+### 2. Validar offline (sem chamadas pagas nem chaves)
+
+```bash
+uv run pytest tests/test_gemini_decision.py tests/test_adversarial.py tests/test_agents.py tests/test_agent_runtime.py tests/test_evaluator.py tests/test_turns.py -v --no-cov
+uvx ruff check .
+uv run pyright
+```
+
+### 3. Executar o laço adversarial e os detectores
+
+```bash
+# Exemplo com Gemini Decision como detector, Claude no ataque e Hydrogen na defesa
+uv run jev-ids adversarial \
+  --dataset data/nsl-kdd/dataset.json \
+  --split smoke \
+  --detector gemini_decision \
+  --attacker claude \
+  --defender hydrogen \
+  --rounds 5 \
+  --max-attempts 3 \
+  --max-note-length 120 \
+  --noise-margin 0 \
+  --k 0
+
+# Execução estática em passada única usando Gemini Decision
+uv run jev-ids run \
+  --dataset data/nsl-kdd/dataset.json \
+  --detector gemini_decision \
+  --split smoke \
+  --k 0 \
+  --seeds 0
+```
+
+Antes da primeira rodada, o modelo de cada agente responde a uma pergunta trivial, feita no mesmo formato estruturado das decisões; se a chamada falhar (chave inválida, modelo inexistente, pedido recusado pelo provedor), o comando termina com uma mensagem clara e nenhuma chamada ao detector é feita. `--noise-margin N` exige que `net` ultrapasse `N` registros para contar como mudança, o que absorve um detector que troca alguns vereditos entre duas chamadas idênticas. `--memory-dir <pasta>` guarda as memórias dos agentes fora da pasta da execução, para que persistam entre execuções: as redações que o atacante não pode repetir e o histórico de custos do defensor são recarregados no início. Use uma pasta de memória por configuração de estudo (mesmo dataset, split e detector), porque os custos só são comparáveis dentro dela.
+
+Cada execução adversarial grava em `results/adv_<dataset>_<detector>_<timestamp>/` (o `:` de `llm:<provedor>` vira `-` no nome da pasta):
+- `config.json`: parâmetros do experimento e provedores/modelos configurados por lado;
+- `rounds.jsonl`: os números de cada rodada (`state_code`, `note`, `instruction_label`, `instructions_sha256`, `attacks_detected`, `attacks_passed`, `attack_errors`, `false_alarms`, `benign_errors`, `newly_alerted`, `newly_passing`, `f1`, `false_alarm_rate`, `turn`, `who_adapts`, `why_adapted`, `next_action`, `rationale`, `error`);
+- `predictions.jsonl` e `responses.jsonl`: uma linha por chamada, gravada logo após a chamada, com `round`, `note`, `instruction_label` e `instructions_sha256` além dos campos da base (`dataset`, `split`, `detector`, `k`, `seed`);
+- `instructions/<rótulo>.txt`: o texto de cada versão de instruções que esteve em vigor, cujo SHA-256 é o `instructions_sha256` das linhas;
+- `memory/attacker.db` e `memory/defender.db`: a memória de cada agente, quando `--memory-dir` não é informado.
+
+Os números por rodada estão em `rounds.jsonl`. O `jev-ids metrics` não serve para uma pasta adversarial, porque agrupa as linhas por célula e juntaria todas as rodadas em uma só.
+
+Uma chamada do detector que falha vira uma linha com `error` e é contada à parte (`attack_errors`, `benign_errors`): não entra nos ataques que passaram, nos falsos alarmes, nas taxas, no F1 nem na regra de quem adapta. Depois de 10 falhas seguidas do detector (ou de uma rodada inteira sem resposta, em um split menor que isso), o laço para com `detector_stopped`. Se o modelo de um agente falhar, o laço para com `agent_unavailable:attacker` ou `agent_unavailable:defender` e o texto do erro em `error`. Nos dois casos as linhas já julgadas ficam gravadas e o comando termina com código de saída diferente de zero.
+
+Abra também o guia visual interativo em [`docs/dashboard.html`](docs/dashboard.html); os números do simulador são ilustrativos, gerados por um detector simulado, e não resultados medidos.
+
+## Comparar detectores
 
 ```bash
 uv run jev-ids run --dataset data/cicids2017/dataset.json --split paper-v2 --delay 200 --detector jev --k 1 --control aimd --selection score+nearest --seeds 0,1,2
@@ -198,82 +273,72 @@ uv run jev-ids run --dataset data/cicids2017/dataset.json --split paper-v2 --del
 uv run jev-ids run --dataset data/cicids2017/dataset.json --split paper-v2 --delay 200 --detector knn --neighbours 4 --k all --seeds 0
 uv run jev-ids metrics --threshold 0.58 results/<jev_run> > results/jev.csv
 uv run jev-ids metrics results/<rf_run> results/<if_run> results/<knn_run> > results/baselines.csv
-uv run jev-ids compare --a results/<jev_run> --b results/<rf_run> --k-a 1 --k-b all --threshold-a 0.58 --subset novel  # novel = zero-day attacks
+uv run jev-ids compare --a results/<jev_run> --b results/<rf_run> --k-a 1 --k-b all --threshold-a 0.58 --subset novel  # novel = zero-day
 ```
 
-`--delay` streams the split with every label coming back D flows late. `--control aimd` hands k to the KController, starting from `--k 1`, and `--selection score+nearest` runs the Selector with the nearest benign flow. `--record compact` is the default. `metrics` prints one CSV row per run with F1, precision, recall, recall on zero-day attacks (`novel` in the code) at their first flows and after their labels came back, recall per category, false alarms, PR-AUC and ROC-AUC of p_attack, tokens, latency and cost, and `--threshold 0.58` reads Jev's verdicts at its cut. `compare` pairs two runs flow by flow and runs McNemar's exact test on the discordant pairs, because only the flows two detectors disagree on tell them apart. Cost is computed offline as tokens times the list prices in [`prices.json`](prices.json), for every detector alike.
+## Reproduzir o artigo
 
-## Reproduce the paper
-
-Each CIC-IDS2017 run of the paper is a `make` target over the `paper-v2` split. A finished run with no failed call leaves a stamp in `results/design-cicids2017/v2-done/`, so `make -k` runs again only what is missing, and a Jev chain and a baseline chain can run in two terminals at once.
+Cada execução do artigo no CIC-IDS2017 é um alvo `make` sobre o split `paper-v2` (deixando marcações em `results/design-cicids2017/v2-done/`):
 
 ```bash
-make v2-cut                  # the full system over the validation stream, then `jev-ids threshold` on its run gives the cut
-make -k v2-d1                # D = 1, the full system at seeds 0 to 2 and the four baselines
-make -k v2-paper-jev         # the full system at D = 25, 50, 100 and 200, then the ablations
-make -k v2-paper-baselines   # the four baselines at D = 25, 50, 100 and 200
-make -k results/design-cicids2017/v2-done/full-d{25,50,100,200}-s{1,2}   # seeds 1 and 2 of the full system
-make -k v2-d500              # D = 500, past the longest burst, as for D = 1
-make -k results/design-cicids2017/v2-done/{full-d250-s0,rf-d250,if-d250,knn4-d250,knnmatched-d250}   # D = 250, seed 0 alone
+make v2-cut                  # sistema completo na validação + jev-ids threshold
+make -k v2-d1                # D = 1 para sistema completo (seeds 0..2) e baselines
+make -k v2-paper-jev         # sistema completo em D = 25, 50, 100 e 200 + ablações
+make -k v2-paper-baselines   # os quatro baselines clássicos em D = 25..200
+make -k v2-d500              # D = 500
 ```
 
-[`docs/jevids-design.md`](docs/jevids-design.md) fixes the split, the cut and the metrics before the runs, logs every change made after a result was seen, and reads each run next to its stamp. The NSL-KDD benchmark runs with `make paper`, as [`docs/protocol.md`](docs/protocol.md) describes.
+O protocolo do NSL-KDD roda com `make paper`, conforme descrito em [`docs/protocol.md`](docs/protocol.md).
 
-## Small enough to read
+## Pequeno o bastante para ler
 
-| File                                                                   | Job                                                                                                         |
-| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| [cli.py](jev_ids/cli.py)                                               | `run`, `redo-errors`, `metrics`, `compare`, `sign-test` and `threshold`                                     |
-| [dataset.py](jev_ids/dataset.py)                                       | The card, the pool, the splits, the k-shot example draw and the compact record                              |
-| [stream.py](jev_ids/stream.py)                                         | The stream, the memory and the labels that come back D flows late                                           |
-| [controller.py](jev_ids/controller.py)                                 | The KController, k per category by mirrored AIMD                                                            |
-| [selector.py](jev_ids/selector.py)                                     | The Selector, examples by score and MMR plus the nearest benign flow                                        |
-| [run.py](jev_ids/run.py)                                               | The loop, cell by cell and flow by flow, and the three files of a run                                       |
-| [records.py](jev_ids/records.py)                                       | One prediction row and its JSONL                                                                            |
-| [metrics.py](jev_ids/metrics.py)                                       | F1, recall per category, PR-AUC, tokens, cost, latency, the paired tests                                    |
-| [detectors/jev.py](jev_ids/detectors/jev.py)                           | Jev through TypeSafe's API, one flow per request                                                            |
-| [detectors/random_forest.py](jev_ids/detectors/random_forest.py)       | The classical baseline                                                                                      |
-| [detectors/knn.py](jev_ids/detectors/knn.py)                           | The nearest-neighbour baseline, in the Selector's distance                                                  |
-| [detectors/isolation_forest.py](jev_ids/detectors/isolation_forest.py) | The unsupervised baseline, fitted on benign traffic alone                                                   |
-| [detectors/llm.py](jev_ids/detectors/llm.py)                           | The LLM baselines through Agno, used on NSL-KDD                                                             |
-| [prompts/](prompts)                                                    | One folder per dataset, with `jev.json`, the whole request template, and `llm.md`, the agent's instructions |
-| [scripts/](scripts)                                                    | One `prepare_<dataset>.py` per dataset, and `draw_split.py` for the splits                                  |
+| Arquivo                                                                | Função                                                                                                                       |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| [cli.py](jev_ids/cli.py)                                               | Subcomandos `run`, `redo-errors`, `metrics`, `compare`, `sign-test`, `threshold` e `adversarial`                             |
+| [adversarial.py](jev_ids/adversarial.py)                               | Orquestrador fechado (`N/B → N/R → S/R → S/B → N′/B`): estado, registro por rodada, paradas e arquivos da execução           |
+| [turns.py](jev_ids/turns.py)                                           | Regra de quem adapta a cada rodada, relativa à rodada anterior e sem LLM                                                     |
+| [evaluator.py](jev_ids/evaluator.py)                                   | Injeção da nota em `service` e avaliador de uma rodada, com as chamadas que falharam contadas à parte                        |
+| [agents.py](jev_ids/agents.py)                                         | Agentes (`AttackerAgent`, `DefenderAgent`): o que cada lado observa e decide, rótulos das instruções e não repetição         |
+| [agent_runtime.py](jev_ids/agent_runtime.py)                           | Modelo Agno por provedor (`claude`, `hydrogen`, etc.), pergunta de verificação e memória em `SqliteDb` por lado              |
+| [dataset.py](jev_ids/dataset.py)                                       | Ficha do dataset, pool, splits, amostragem `k-shot` e formato compacto                                                       |
+| [stream.py](jev_ids/stream.py)                                         | Stream temporal, memória e rótulos retornando com atraso `D`                                                                 |
+| [controller.py](jev_ids/controller.py)                                 | `KController`: ajusta `k` por categoria via AIMD espelhado                                                                   |
+| [selector.py](jev_ids/selector.py)                                     | `Selector`: escolhe exemplos por similaridade/MMR e âncora benigna mais próxima                                              |
+| [run.py](jev_ids/run.py)                                               | Laço estático/stream célula por célula e geração dos arquivos de saída                                                       |
+| [records.py](jev_ids/records.py)                                       | Montagem das linhas de predição e gravação em JSONL                                                                          |
+| [metrics.py](jev_ids/metrics.py)                                       | F1, recall por categoria, PR-AUC, tokens, custo por preço unitário, latência e testes pareados                               |
+| [detectors/jev.py](jev_ids/detectors/jev.py)                           | Jev pela API da TypeSafe, um fluxo por requisição                                                                            |
+| [detectors/gemini_decision.py](jev_ids/detectors/gemini_decision.py)   | Google Gemini Decisions API (`gemini-decision-1`) via `google-genai`                                                         |
+| [detectors/random_forest.py](jev_ids/detectors/random_forest.py)       | Baseline clássico supervisionado (Random Forest)                                                                             |
+| [detectors/knn.py](jev_ids/detectors/knn.py)                           | Baseline kNN na mesma métrica de distância do Selector                                                                       |
+| [detectors/isolation_forest.py](jev_ids/detectors/isolation_forest.py) | Baseline não supervisionado treinado apenas com tráfego benigno                                                              |
+| [detectors/llm.py](jev_ids/detectors/llm.py)                           | Baselines de LLM via Agno (`deepseek`, `openai`, `gemini`)                                                                   |
+| [prompts/](prompts)                                                    | Uma pasta por dataset com `jev.json` e `llm.md`                                                                              |
+| [scripts/](scripts)                                                    | Scripts `prepare_<dataset>.py` e geração de splits (`draw_split.py`)                                                         |
+| [docs/dashboard.html](docs/dashboard.html)                             | Dashboard HTML interativo explicando a dinâmica `N/B → N′/B` e como executar o projeto                                       |
 
-## Development
+## Desenvolvimento
 
 ```bash
 make check
 ```
 
-Python 3.13+. The gate runs ruff with Google-style docstring rules, complexipy, pyright in strict mode, pytest with coverage, vulture, pip-audit and jscpd. Thresholds live in `pyproject.toml` and `.jscpd.json`. Runs make paid API calls and write only under `results/`.
+Requer Python 3.13+. A bateria de qualidade executa `ruff` (incluindo docstrings Google, limite de complexidade ciclomática e máximo de 5 parâmetros), `complexipy`, `pyright` em modo estrito, `pytest` com cobertura, `vulture`, `pip-audit` e `jscpd`.
 
-## Bring your own flows
+## Traga seus próprios fluxos
 
-Jev IDS is an independent research prototype, not a product. Its numbers come from two benchmarks, CIC-IDS2017 and NSL-KDD, and the project is independent of TypeSafe. It can still sit inside a commercial solution, and this is how.
+O Jev IDS é um protótipo de pesquisa independente, não um produto comercial, e pode ser conectado ao lado de um SIEM/IDS existente para julgar fluxos de forma assíncrona fora da linha crítica de pacotes:
 
-### Where Jev fits
+### Seis passos
 
-A commercial IDS already has sensors, a flow exporter and a signature engine feeding a SIEM. Jev IDS replaces none of them. It sits beside the pipeline, off the packet path, and judges one flow record at a time.
+1. **Configure uma chave:** defina `TYPESAFE_API_KEY` (Jev) ou `GEMINI_API_KEY` (Gemini Decision) no `.env`.
+2. **Descreva seus fluxos:** crie um card JSON como [`data/cicids2017/dataset.json`](data/cicids2017/dataset.json) listando colunas, campos simbólicos e categorias.
+3. **Adapte o template:** copie [`prompts/cicids2017/jev.json`](prompts/cicids2017/jev.json) ajustando `columns` e `categories`.
+4. **Semeie a memória:** um exemplo rotulado por categoria basta para iniciar com o `KController`.
+5. **Chame o detector:** `JevDetector(load_prompt(path)).predict(flow, examples)` ou `GeminiDecisionDetector(...)` devolve `p_attack`, `category_pred` e `confidence`.
+6. **Meça antes de confiar:** execute `jev-ids run --delay` e `jev-ids metrics` sobre seus próprios splits rotulados.
 
-- **A net behind the signatures.** Signatures miss what they have never seen. Sample the flows the engine passed as clean, or every flow to a critical asset, and let Jev judge them. On CIC-IDS2017, with labels 200 flows late, it caught 54% of the zero-day attacks where a Random Forest caught 29%.
-- **Learning from the analysts.** Every alert an analyst confirms or dismisses goes back into the memory as a labeled flow, and the Selector and the KController use it from the next request on, with no retraining.
-- **A category for the playbook.** The `choice` answer names the category with a confidence, so the SIEM routes DoS, PortScan and BruteForce, or your own taxonomy, to different runbooks with no parser in between.
-- **Coverage from day one.** A new site or tenant has no training set. Jev starts from one labeled flow per category, so it covers the segment while a classical model is still collecting data.
-
-A quarter of a second per verdict and a rate-limited API make this an asynchronous side channel, fed from the exporter (NetFlow, IPFIX, Zeek `conn.log`) through a queue, never an inline filter.
-
-### Six steps
-
-1. **Get a key.** Jev is served by TypeSafe. Set `TYPESAFE_API_KEY` in `.env`. Pricing and terms are TypeSafe's.
-2. **Describe your flows.** Write a dataset card like [`data/cicids2017/dataset.json`](data/cicids2017/dataset.json), with the columns your flow exporter emits in order, which of them are symbolic, your categories and which one is benign.
-3. **Write the request.** Copy [`prompts/cicids2017/jev.json`](prompts/cicids2017/jev.json), replace `columns` and the category descriptions with yours, and keep the two questions.
-4. **Seed the memory.** One labeled flow per category from your own network is enough to start, because the KController begins at k = 1 and raises k only for the categories Jev gets wrong.
-5. **Call the detector.** `JevDetector(load_prompt(path)).predict(flow, examples)` returns `p_attack`, `category_pred` and `confidence` for one flow in about a quarter of a second, and [`stream.py`](jev_ids/stream.py) shows how the memory, the Selector and the KController choose `examples` at each step. Route `p_attack` to your alerting with the cut your alarm budget allows. 0.58 was the benchmark's choice, not a rule.
-6. **Measure before you trust.** Run `jev-ids run --delay` and `jev-ids metrics` on a labeled split of your own flows. The numbers above are CIC-IDS2017's, not yours.
-
-Only flow features leave your network, never payloads, but they do leave it. Every request goes to TypeSafe's API.
-
-## Team
+## Equipe (base original Jev IDS)
 
 <table align="center">
   <tr>
@@ -297,4 +362,4 @@ Only flow features leave your network, never payloads, but they do leave it. Eve
 
 ---
 
-[TypeSafe docs](https://docs.typesafe.ai/introduction) · [Jev models and pricing](https://docs.typesafe.ai/models) · [CIC-IDS2017, relabelled](https://intrusion-detection.distrinet-research.be/CNS2022/Dataset_Download.html) · [NSL-KDD](https://www.kaggle.com/datasets/hassan06/nslkdd) · [Glossary](CONTEXT.md)
+[Documentação TypeSafe](https://docs.typesafe.ai/introduction) · [Modelos e preços Jev](https://docs.typesafe.ai/models) · [CIC-IDS2017 re-rotulado](https://intrusion-detection.distrinet-research.be/CNS2022/Dataset_Download.html) · [NSL-KDD](https://www.kaggle.com/datasets/hassan06/nslkdd) · [Glossário](CONTEXT.md)
