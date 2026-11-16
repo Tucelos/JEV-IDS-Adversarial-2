@@ -241,6 +241,14 @@ Mesma configuração (atacante Qwen, defensor Hydrogen, split `internal`, 5 roda
 
 Os dois caem para perto de zero de detecção sob a nota inicial (`N/B`) e se recuperam conforme o defensor endurece as instruções, o que confirma o efeito nos dois. Eles diferem no equilíbrio: o **Clef detecta de forma mais agressiva** (chega a pegar todos os 31 ataques nas rodadas 3 e 5), mas ao custo de uma **taxa de falso alarme muito alta** (cerca de metade do tráfego legítimo marcada como ataque em toda rodada). O **Gemini Decision é mais equilibrado**: detecção máxima menor (0,84), porém com falso alarme bem menor (0,11 a 0,21). Pelo F1 os dois chegam perto no pico (ambos ~0,85). Qual é "mais efetivo" depende do que se valoriza: cobertura de ataques favorece o Clef; o custo ao usuário legítimo (o ativo AT4 do Trabalho 1) favorece o Gemini Decision por larga margem.
 
+As duas figuras abaixo resumem a comparação, geradas de `detector_comparison.csv` por `scripts/plot_detector_comparison.py` (matplotlib entra só na execução: `uv run --with matplotlib python -m scripts.plot_detector_comparison`):
+
+![Taxa de detecção, de falso alarme e F1 por rodada, uma linha por detector](results/comparison/metricas_por_rodada.png)
+
+![Trade-off entre detecção e falso alarme: a trajetória de cada detector pelas rodadas, canto superior esquerdo é o melhor](results/comparison/tradeoff_deteccao_falso_alarme.png)
+
+O trade-off deixa a diferença visível: o Gemini Decision fica à esquerda (falso alarme baixo) e o Clef à direita (cerca de metade do tráfego legítimo marcado), enquanto os dois sobem em detecção ao longo das rodadas.
+
 **Limites desta medição.** Cada ponto é uma única execução, e nem o detector nem os modelos dos agentes são determinísticos, então os números variam entre execuções; são uma amostra, não uma média. A seção 9 reúne as demais limitações. O custo somado das chamadas de detector foi de poucos centavos de dólar.
 
 ## 7. Coerência com o Trabalho 1
