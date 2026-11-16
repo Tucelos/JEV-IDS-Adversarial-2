@@ -13,6 +13,8 @@ from agno.run.base import RunStatus
 
 from jev_ids.agent_runtime import (
     HYDROGEN_KEY_VARS,
+    OPENAI_LIKE_PROVIDERS,
+    QWEN_DEFAULT_BASE_URL,
     AgentBundle,
     AgentMemory,
     AgentUnavailableError,
@@ -61,6 +63,23 @@ def test_hydrogen_takes_its_key_from_the_environment_in_order(monkeypatch: pytes
     model = make_agent_model("hydrogen")
     assert isinstance(model, OpenAILike)
     assert (model.id, model.api_key) == ("gemini-4-hydrogen", "test-h-key")
+
+
+def test_each_openai_like_provider_has_its_own_key_and_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every provider reached through the OpenAI chat API answers to its own variables, so one of them never borrows another's key.
+    for endpoint in OPENAI_LIKE_PROVIDERS.values():
+        for name in (*endpoint.key_vars, endpoint.base_url_var):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("QWEN_API_KEY", "test-q-key")
+    model = make_agent_model("qwen")
+    assert isinstance(model, OpenAILike)
+    assert (model.id, model.api_key, model.base_url) == ("Qwen3.8-27B", "test-q-key", QWEN_DEFAULT_BASE_URL)
+    assert make_agent_model("qwen", "Other-7B").id == "Other-7B"
+    monkeypatch.setenv("QWEN_BASE_URL", "https://elsewhere.example/v1")
+    assert make_agent_model("qwen").base_url == "https://elsewhere.example/v1"
+    # The hydrogen agent has no key of its own now, and says so instead of taking the one next to it.
+    with pytest.raises(RuntimeError, match="the hydrogen agent needs an API key"):
+        make_agent_model("hydrogen")
 
 
 def test_hydrogen_without_a_key_names_the_variables_instead_of_sending_a_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:

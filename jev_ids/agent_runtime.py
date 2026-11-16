@@ -3,7 +3,7 @@
 In reading order:
 
 - `AgentUnavailableError`: what any failure of a participant's model becomes, so the loop records it and stops instead of crashing.
-- `hydrogen_api_key` and `make_agent_model`: the Agno model of a participant, by provider.
+- `OPENAI_LIKE_PROVIDERS`, `api_key_of` and `make_agent_model`: the Agno model of a participant, by provider.
 - `check_agent_model`: the one trivial question that finds a bad key before a round of detector calls is paid for.
 - `AgentBundle` and `AgentMemory`: one participant's Agno `Agent`, `LearningMachine` and `SqliteDb`.
 
@@ -32,13 +32,37 @@ from pydantic import BaseModel
 from jev_ids.detectors import llm
 
 HYDROGEN_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+QWEN_DEFAULT_BASE_URL = "https://api.tokenlab.amd.com/v1"
 # Naming the variables the hydrogen agent takes its key from, in order of preference.
 HYDROGEN_KEY_VARS = ("HYDROGEN_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+QWEN_KEY_VARS = ("QWEN_API_KEY",)
 AGENT_DEFAULT_MODELS: dict[str, str] = {
     "claude": "claude-sonnet-5-5",
     "anthropic": "claude-sonnet-5-5",
     "hydrogen": "gemini-4-hydrogen",
+    "qwen": "Qwen3.8-27B",
     **llm.DEFAULT_MODEL,
+}
+
+
+@dataclass(frozen=True)
+class OpenAIEndpoint:
+    """A provider an agent reaches through the OpenAI chat API.
+
+    Attributes:
+        key_vars: the environment variables its key may come from, in order of preference.
+        base_url_var: the variable that overrides its endpoint.
+        default_base_url: the endpoint used when that variable is unset.
+    """
+
+    key_vars: tuple[str, ...]
+    base_url_var: str
+    default_base_url: str
+
+
+OPENAI_LIKE_PROVIDERS: dict[str, OpenAIEndpoint] = {
+    "hydrogen": OpenAIEndpoint(HYDROGEN_KEY_VARS, "HYDROGEN_BASE_URL", HYDROGEN_DEFAULT_BASE_URL),
+    "qwen": OpenAIEndpoint(QWEN_KEY_VARS, "QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL),
 }
 PROBE_QUESTION = "Connectivity check before the study starts: no data is under review yet. Answer with the action `keep`."
 # Cutting an error text to this length before it reaches a record, a log line or the terminal.
@@ -60,13 +84,24 @@ class AgentUnavailableError(RuntimeError):
         super().__init__(f"{role}: {self.detail}")
 
 
-def hydrogen_api_key() -> str:
-    """The key of the hydrogen agent, from the first of HYDROGEN_KEY_VARS that is set; none set is an error, never a placeholder key."""
-    for name in HYDROGEN_KEY_VARS:
+def api_key_of(provider: str) -> str:
+    """The key of an OpenAI-compatible provider, from the first of its variables that is set.
+
+    Args:
+        provider: a key of OPENAI_LIKE_PROVIDERS.
+
+    Returns:
+        The key, never a placeholder.
+
+    Raises:
+        RuntimeError: when none of the provider's variables is set, naming them all.
+    """
+    key_vars = OPENAI_LIKE_PROVIDERS[provider].key_vars
+    for name in key_vars:
         value = os.environ.get(name)
         if value:
             return value
-    raise RuntimeError(f"the hydrogen agent needs an API key: set one of {', '.join(HYDROGEN_KEY_VARS)}")
+    raise RuntimeError(f"the {provider} agent needs an API key: set one of {', '.join(key_vars)}")
 
 
 def make_agent_model(provider: str, model_id: str | None = None) -> Any:
@@ -80,9 +115,10 @@ def make_agent_model(provider: str, model_id: str | None = None) -> Any:
         # Leaving `temperature` out, because the Messages API version the SDK sends (2026-10-21) rejects it
         # and Claude Sonnet 5.5 accepts the default sampling values only.
         return Claude(id=resolved)
-    if normalized == "hydrogen":
-        base_url = os.environ.get("HYDROGEN_BASE_URL") or HYDROGEN_DEFAULT_BASE_URL
-        return OpenAILike(id=resolved, api_key=hydrogen_api_key(), base_url=base_url, temperature=0.0)
+    endpoint = OPENAI_LIKE_PROVIDERS.get(normalized)
+    if endpoint is not None:
+        base_url = os.environ.get(endpoint.base_url_var) or endpoint.default_base_url
+        return OpenAILike(id=resolved, api_key=api_key_of(normalized), base_url=base_url, temperature=0.0)
     return llm.make_model(normalized, resolved)
 
 
