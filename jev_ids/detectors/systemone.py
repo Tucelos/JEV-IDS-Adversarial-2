@@ -40,9 +40,10 @@ DEFAULT_BASE_URL = "https://api.tokenlab.amd.com/v1"
 DEFAULT_MODEL = "Clef"
 ENDPOINT = "/systemone"
 HTTP_OK = 200
-# Waiting out a passing refusal for up to 45 s before `post` retries, shorter than an agent's patience because every refused
-# attempt is retried again by `post`, and a round of 50 records stops after 10 failed calls in a row.
-PATIENCE: tuple[float, ...] = (15.0, 30.0)
+# Waiting out a passing refusal for up to almost four minutes before `post` retries, shorter than an agent's patience because
+# `post` tries five times: a record gives up only after some 19 minutes of outage, so an outage costs a round one unanswered
+# record at most instead of the 10 failed calls in a row that stop it.
+PATIENCE: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
 
 
 class SystemOneDetector(DecisionTemplate):

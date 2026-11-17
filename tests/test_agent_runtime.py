@@ -221,6 +221,8 @@ def test_the_qwen_agent_rides_out_a_refusal_through_the_spaced_transport(monkeyp
     model = make_agent_model("qwen")
     assert isinstance(model.http_client, httpx.Client)
     assert model.http_client.timeout == AGENT_TIMEOUT
+    # The transport is the one retry policy, so the SDK's own quick retries are off.
+    assert model.max_retries == 0
     check_agent_model(model, "attacker", AttackerDecision)
     check_agent_model(model, "attacker", AttackerDecision)
     assert built == [(QWEN_DEFAULT_BASE_URL, PATIENT_WAITS)]
@@ -228,4 +230,5 @@ def test_the_qwen_agent_rides_out_a_refusal_through_the_spaced_transport(monkeyp
     assert clock.slept == [15.0, 3.0]
     # The hydrogen agent's gateway sets no such ceiling, so its requests go through the SDK's own client, unspaced.
     monkeypatch.setenv("HYDROGEN_API_KEY", "test-h-key")
-    assert make_agent_model("hydrogen").http_client is None
+    hydrogen = make_agent_model("hydrogen")
+    assert (hydrogen.http_client, hydrogen.max_retries) == (None, None)

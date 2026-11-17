@@ -40,8 +40,10 @@ DEFAULT_CALLS_PER_MINUTE = 18.0
 # Sharing the QWEN_ prefix of the key and the endpoint the spaced clients read.
 CALLS_PER_MINUTE_VAR = "QWEN_CALLS_PER_MINUTE"
 SECONDS_PER_MINUTE = 60.0
-# Waiting up to almost four minutes in all before a refused request is given back, so a long run outlives a passing outage.
-PATIENT_WAITS: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
+# Waiting close to an hour in all before a refused request is given back: doubling from 15 s to 4 min, then every 5 min. TokenLab's
+# Qwen was down for about 15 and 25 minutes in two outages on 2026-11-17, and a long run must outlive both kinds; the attempts
+# made while waiting are a dozen or so, far under the ceiling.
+PATIENT_WAITS: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0, 240.0, *([300.0] * 10))
 
 logger = logging.getLogger(__name__)
 

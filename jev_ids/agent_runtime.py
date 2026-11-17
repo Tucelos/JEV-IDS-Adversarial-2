@@ -134,13 +134,16 @@ def make_agent_model(provider: str, model_id: str | None = None) -> Any:
 def _openai_like_model(provider: str, endpoint: OpenAIEndpoint, model_id: str) -> OpenAILike:
     """The Agno model of a provider reached through the OpenAI chat API.
 
-    A spaced provider gets its own httpx client, whose transport sends every request, the SDK's retries included, only when the
-    spacer its host shares with every other client gives it a turn, and sends a passing refusal again after patient waits
-    (`rate_limit.py`). The SDK sees one answer, so the agent's session never holds a failed attempt.
+    A spaced provider gets its own httpx client, whose transport sends every request only when the spacer its host shares with
+    every other client gives it a turn, and sends a passing refusal again after patient waits (`rate_limit.py`). The SDK's own
+    quick retries are switched off, so the transport's patience is the whole patience instead of starting over on each of them,
+    and the SDK sees one answer, so the agent's session never holds a failed attempt.
     """
     base_url = os.environ.get(endpoint.base_url_var) or endpoint.default_base_url
-    http_client = httpx.Client(transport=spaced_transport(base_url), timeout=AGENT_TIMEOUT) if endpoint.spaced else None
-    return OpenAILike(id=model_id, api_key=api_key_of(provider), base_url=base_url, temperature=0.0, http_client=http_client)
+    if not endpoint.spaced:
+        return OpenAILike(id=model_id, api_key=api_key_of(provider), base_url=base_url, temperature=0.0)
+    http_client = httpx.Client(transport=spaced_transport(base_url), timeout=AGENT_TIMEOUT)
+    return OpenAILike(id=model_id, api_key=api_key_of(provider), base_url=base_url, temperature=0.0, http_client=http_client, max_retries=0)
 
 
 def _run_checked(agent: Any, role: str, prompt: str, **run_options: Any) -> Any:
