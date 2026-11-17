@@ -16,7 +16,7 @@ its reason, the model is asked once more, and a second refusal is a hold.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -249,8 +249,11 @@ def _settle[T](propose: Callable[[str], T], refusal_of: Callable[[T], str | None
 class AttackerAgent:
     """Black-box Agno agent proposing `service` notes from the alert counts of its own records, and nothing else."""
 
-    def __init__(self, model: Any, memory_dir: Path) -> None:
-        """Create the attacker's agent on `<memory_dir>/attacker.db` and load the wordings retired by earlier runs."""
+    def __init__(self, model: Any, memory_dir: Path, reopen: bool = False) -> None:
+        """Create the attacker's agent on `<memory_dir>/attacker.db` and load the wordings retired by earlier runs.
+
+        With `reopen`, the agent goes on with the session it last ran in there, as a resumed run does.
+        """
         self.model = model
         self.memory = AgentMemory(
             AgentBundle(
@@ -260,6 +263,7 @@ class AttackerAgent:
                 output_schema=AttackerDecision,
                 initial_state={"attempt_history": []},
                 memory_dir=memory_dir,
+                reopen=reopen,
             )
         )
         stored = self.memory.load_records(RETIRED_NOTE, RetiredNote)
@@ -268,7 +272,7 @@ class AttackerAgent:
     def observe(self, obs: AttackerObservation) -> None:
         """Store the round's counts over its own records in private session state, user memory and decision log."""
         history: list[dict[str, Any]] = self.memory.state.setdefault("attempt_history", [])
-        history.append(obs.model_dump(exclude={"max_note_length"}))
+        history.append(attempt_entry(obs))
         outcome = f"{obs.alerts} of {obs.attempts} records alerted"
         summary = (
             f"Round {obs.round_index}: note={obs.note_used!r} -> {outcome} "
@@ -276,6 +280,14 @@ class AttackerAgent:
         )
         self.memory.remember(summary)
         self.memory.log(f"tested_note:{obs.note_used!r}", summary, outcome=outcome)
+
+    def restore(self, observations: Sequence[AttackerObservation]) -> None:
+        """Put back the session state of a run that stopped: what the attacker was told of each round, without telling it again.
+
+        The state is rebuilt from the run's own rounds rather than read from the stored session, which Agno saves only when the
+        agent runs, so it lags behind every round the attacker observed without being asked.
+        """
+        self.memory.state["attempt_history"] = [attempt_entry(obs) for obs in observations]
 
     def retire(self, note: str) -> None:
         """Forbid `note` from now on: it was in force when the orchestrator gave the attacker the turn because alerts rose."""
@@ -332,6 +344,11 @@ class AttackerAgent:
         return None
 
 
+def attempt_entry(obs: AttackerObservation) -> dict[str, Any]:
+    """One round as the attacker's session state keeps it: its observation, without the note length, which never changes."""
+    return obs.model_dump(exclude={"max_note_length"})
+
+
 def _note_in_force_after(answer: AttackerDecision, obs: AttackerObservation) -> str:
     """The note an answer puts in force: `keep` holds it whatever text came back, `remove` empties it, a rewording is sanitized.
 
@@ -370,8 +387,11 @@ def _cost_line(record: InstructionCostRecord) -> str:
 class DefenderAgent:
     """Adaptive Agno agent tuning detector instructions (`B`, `R`, or a revision it writes) from evaluator costs."""
 
-    def __init__(self, model: Any, memory_dir: Path, base_instructions: str, reinforced_instructions: str) -> None:
-        """Create the defender's agent on `<memory_dir>/defender.db` and load the costs measured by earlier runs."""
+    def __init__(self, model: Any, memory_dir: Path, base_instructions: str, reinforced_instructions: str, reopen: bool = False) -> None:
+        """Create the defender's agent on `<memory_dir>/defender.db` and load the costs measured by earlier runs.
+
+        With `reopen`, the agent goes on with the session it last ran in there, as a resumed run does.
+        """
         self.model = model
         self.versions = InstructionVersions(base_instructions, reinforced_instructions)
         self.memory = AgentMemory(
@@ -382,9 +402,18 @@ class DefenderAgent:
                 output_schema=DefenderDecision,
                 initial_state={"instruction_history": []},
                 memory_dir=memory_dir,
+                reopen=reopen,
             )
         )
         self.cost_history: list[InstructionCostRecord] = self._stored_history()
+
+    def restore(self) -> None:
+        """Put back the session state of a run that stopped: one line per cost measured, rebuilt from the costs in the ledger.
+
+        The ledger holds every round the defender observed, while the stored session holds only those it had observed when it last
+        ran, so the state is rebuilt from the ledger, as each `observe` wrote it.
+        """
+        self.memory.state["instruction_history"] = [_cost_line(record) for record in self.cost_history]
 
     def _stored_history(self) -> list[InstructionCostRecord]:
         """The cost records of earlier runs in the order they were measured, each labeled again from its text."""

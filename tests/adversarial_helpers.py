@@ -1,5 +1,6 @@
 """Offline doubles shared by the adversarial tests: a scripted Agno model, a rule-based detector, their Flows and a loop builder."""
 
+import json
 from collections.abc import AsyncIterator, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,6 +149,19 @@ def defender_says(action: str, instructions: str = "", label: str = "?", rationa
     return DefenderDecision.model_validate(fields).model_dump_json()
 
 
+# Scripting the canonical cycle: the defender reinforces and later relaxes, the attacker removes its note and later rewrites it.
+# The labels the defender's model writes are wrong on purpose, because the loop must not read them.
+ATTACKER_SCRIPT = [attacker_says("remove"), attacker_says("reformulate", "ticket-4821")]
+DEFENDER_SCRIPT = [defender_says("reinforce", label="V9"), defender_says("relax", label="R")]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """The lines of a JSONL file as dicts; an absent file has none."""
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def make_spec(results_dir: Path, **overrides: Any) -> AdversarialSpec:
     """A spec for the loop tests: five rounds on the mock detector, three attempts, notes of at most 60 characters."""
     fields: dict[str, Any] = {
@@ -188,14 +202,14 @@ class AgentFactory:
         self.memory_dir = root / "memory"
         self._opened: list[AttackerAgent | DefenderAgent] = []
 
-    def attacker(self, script: Sequence[str | Exception], memory_dir: Path | None = None) -> AttackerAgent:
-        agent = AttackerAgent(ScriptedAgnoModel("scripted-attacker", script), memory_dir or self.memory_dir)
+    def attacker(self, script: Sequence[str | Exception], memory_dir: Path | None = None, reopen: bool = False) -> AttackerAgent:
+        agent = AttackerAgent(ScriptedAgnoModel("scripted-attacker", script), memory_dir or self.memory_dir, reopen=reopen)
         self._opened.append(agent)
         return agent
 
-    def defender(self, script: Sequence[str | Exception], memory_dir: Path | None = None) -> DefenderAgent:
+    def defender(self, script: Sequence[str | Exception], memory_dir: Path | None = None, reopen: bool = False) -> DefenderAgent:
         model = ScriptedAgnoModel("scripted-defender", script)
-        agent = DefenderAgent(model, memory_dir or self.memory_dir, BASE_INSTRUCTIONS, REINFORCED_INSTRUCTIONS)
+        agent = DefenderAgent(model, memory_dir or self.memory_dir, BASE_INSTRUCTIONS, REINFORCED_INSTRUCTIONS, reopen=reopen)
         self._opened.append(agent)
         return agent
 
@@ -204,10 +218,16 @@ class AgentFactory:
         attacker_script: Sequence[str | Exception],
         defender_script: Sequence[str | Exception],
         detector: MockDecisionDetector | None = None,
+        reopen: bool = False,
     ) -> Loop:
-        attacker, defender = self.attacker(attacker_script), self.defender(defender_script)
+        attacker, defender = self.attacker(attacker_script, reopen=reopen), self.defender(defender_script, reopen=reopen)
         judge = detector or MockDecisionDetector()
         return Loop(Orchestrator(judge, attacker, defender, ADV_CONFIG), judge, attacker.model, defender.model)
+
+    def restart(self) -> None:
+        """Close every agent opened so far, as a process that stopped would, so the next ones open the files afresh."""
+        self.close()
+        self._opened.clear()
 
     def close(self) -> None:
         for agent in self._opened:

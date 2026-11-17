@@ -7,9 +7,12 @@ In reading order:
 - `RoundState`, `Adaptation` and `RoundRecord`: what a round starts from, how it ended, and the line it leaves in `rounds.jsonl`.
 - `state_code_for`: the compact code of a round (`N/B`, `N/R`, `S/R`, `S/B`, `N'/B`).
 - `relative_memory_dir`: the agents' memory folder as `config.json` records it, relative to the run directory.
-- `Orchestrator`: the loop `action -> detector verdict -> observation -> adaptation`, with no model of its own.
+- `read_rounds` and `read_resumable`: the rounds a run recorded, and those of a run that stopped on a failure.
+- `Orchestrator`: the loop `action -> detector verdict -> observation -> adaptation`, with no model of its own, and the resumption
+  of a run that stopped on a failure (`Orchestrator.resume_loop`).
 - `failure_of`: the reason a run ended on a failure, which the CLI turns into its exit code.
-- `check_detector_name` and `run_adversarial`: the CLI entry that strings the above together.
+- `check_detector_name`, `run_adversarial`, `spec_of` and `resume_adversarial`: the CLI entries that string the above together, to
+  start a run or to go on with one that stopped.
 
 The attacker (`agents.AttackerAgent`) may only change the note appended to the `service` field of the attack Flows
 (`evaluator.apply_note`) and only learns how many of its own records raised an alert. The defender (`agents.DefenderAgent`) may only
@@ -20,6 +23,8 @@ stops as `stable`.
 
 A run writes `config.json`, one row per call in `predictions.jsonl` (appended right after the call), one line per round in `rounds.jsonl`,
 the text of every instruction version that was in force as `instructions/<label>.txt`, and the agents' memories, under `memory/` by default.
+A resumed run adds each resumption to `config.json` and, when the detector had cut a round short, keeps that round's rows in
+`interrupted.jsonl`.
 """
 
 from __future__ import annotations
@@ -27,19 +32,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
-from jev_ids import records
+from jev_ids import ROOT, records
 from jev_ids.agent_runtime import AgentUnavailableError, check_agent_model, make_agent_model
 from jev_ids.agents import AttackerAgent, AttackerDecision, AttackerObservation, DefenderAgent, DefenderDecision, DefenderObservation
 from jev_ids.dataset import Config, Flow, load_config, load_split
 from jev_ids.detectors import DecisionDetector
-from jev_ids.evaluator import RoundEvaluation, RoundPlan, evaluate_round, sanitize_note, service_feature_index
+from jev_ids.evaluator import RoundEvaluation, RoundPlan, evaluate_round, sanitize_note, service_feature_index, summarize_rows
 from jev_ids.records import Prediction
 from jev_ids.run import RESULTS_DIR, RunSpec, build_detector, sample_examples
 from jev_ids.turns import ATTACK_ALERTED, ATTACKER, DEFENDER, Evidence, Shift, Turn, decide_who_adapts, other_side, shift_between
@@ -310,6 +315,143 @@ def _append_round(run_dir: Path | None, record: RoundRecord) -> None:
         handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
 
+def _feedback(state: RoundState, outcome: _Outcome) -> _Feedback:
+    """Each side's observation of the round just judged.
+
+    The attacker gets counts over its own attack records and nothing about the defense. The defender gets the aggregate counts,
+    the instructions in force and the notes that were tested.
+    """
+    counts, shift = outcome.evaluation.counts, outcome.shift
+    return _Feedback(
+        attacker=AttackerObservation(
+            round_index=state.round_index,
+            note_used=state.note,
+            attempts=counts.attacks_detected + counts.attacks_passed,
+            alerts=counts.attacks_detected,
+            newly_alerted=shift.newly_alerted,
+            newly_passing=shift.newly_passing,
+            remaining_attempts=state.remaining_attempts,
+            max_note_length=state.max_note_length,
+        ),
+        defender=DefenderObservation(
+            round_index=state.round_index,
+            instruction_label=outcome.version.label,
+            instructions=state.instructions,
+            notes_tested=outcome.evaluation.notes_tested,
+            **asdict(counts),
+        ),
+    )
+
+
+def _evidence(state: RoundState, outcome: _Outcome) -> Evidence:
+    """What the turn rule reads of the round just judged, against the previous round the state still holds."""
+    counts = outcome.evaluation.counts
+    return Evidence(
+        first_round=state.previous_verdicts is None,
+        attacks_detected=counts.attacks_detected,
+        attacks_passed=counts.attacks_passed,
+        shift=outcome.shift,
+        note_unchanged=state.note == state.previous_note,
+    )
+
+
+def read_rounds(run_dir: Path) -> list[RoundRecord]:
+    """The rounds a run recorded in `rounds.jsonl`, in order; none when it recorded none."""
+    path = run_dir / "rounds.jsonl"
+    if not path.exists():
+        return []
+    return [RoundRecord(**json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def read_resumable(run_dir: Path) -> list[RoundRecord]:
+    """The rounds of a run that stopped on a failure, the stopped one last.
+
+    Raises:
+        ValueError: when the run recorded no round, or ended in order, on its last round or with both sides holding.
+    """
+    history = read_rounds(run_dir)
+    if failure_of(history) is None:
+        raise ValueError(f"{run_dir.name} did not stop on a failure, so there is nothing to resume")
+    return history
+
+
+def _rewrite_rounds(run_dir: Path, history: Sequence[RoundRecord]) -> None:
+    """Write `rounds.jsonl` again with `history`, after a resumption replaced or set aside its last round."""
+    lines = "".join(json.dumps(asdict(record), ensure_ascii=False) + "\n" for record in history)
+    (run_dir / "rounds.jsonl").write_text(lines, encoding="utf-8")
+
+
+def _rows_by_round(run_dir: Path) -> dict[int, list[Prediction]]:
+    """The rows of `predictions.jsonl` grouped by round, each group in the order its calls were made."""
+    grouped: dict[int, list[Prediction]] = {}
+    for row in records.read_predictions(run_dir):
+        grouped.setdefault(row["round"], []).append(row)
+    return grouped
+
+
+def _outcome_of(record: RoundRecord, rows: Sequence[Prediction]) -> _Outcome:
+    """What a recorded round measured, read back from its rows exactly as `evaluate_round` summed them when the round closed."""
+    version = _Version(record.instruction_label, record.instructions_sha256)
+    return _Outcome(version, summarize_rows(rows, record.note), Shift(record.newly_alerted, record.newly_passing))
+
+
+def _instructions_of(run_dir: Path, record: RoundRecord) -> str:
+    """The instructions a round was judged under, read from their file, which must still hash to the round's sha256."""
+    payload = (run_dir / "instructions" / f"{record.instruction_label}.txt").read_bytes()
+    if hashlib.sha256(payload).hexdigest() != record.instructions_sha256:
+        raise ValueError(f"instructions/{record.instruction_label}.txt no longer matches round {record.round}")
+    return payload.decode("utf-8")
+
+
+def _judged_state(run_dir: Path, record: RoundRecord, spec: AdversarialSpec) -> RoundState:
+    """The state a recorded round was judged from: its note, its instructions, the attempts it left and the longest note allowed."""
+    return RoundState(
+        round_index=record.round,
+        note=record.note,
+        instructions=_instructions_of(run_dir, record),
+        remaining_attempts=record.attempts_left,
+        max_note_length=spec.max_note_length,
+    )
+
+
+def _told_attacker(
+    run_dir: Path, told: Sequence[RoundRecord], rows: dict[int, list[Prediction]], spec: AdversarialSpec
+) -> list[AttackerObservation]:
+    """What the attacker was told of each round in `told`, rebuilt from the round's line and rows as `_feedback` built it then."""
+    return [_feedback(_judged_state(run_dir, record, spec), _outcome_of(record, rows[record.round])).attacker for record in told]
+
+
+def _resumed_state(
+    run_dir: Path, history: Sequence[RoundRecord], stopped: RoundRecord, rows: dict[int, list[Prediction]], spec: AdversarialSpec
+) -> RoundState:
+    """The state the stopped round was judged from, with the previous round's note and verdicts the turn rule compares it with."""
+    state = _judged_state(run_dir, stopped, spec)
+    if history:
+        previous = history[-1]
+        state.previous_note = previous.note
+        state.previous_verdicts = _outcome_of(previous, rows[previous.round]).evaluation.attack_verdicts
+    state.first_note = next((record.note for record in history if record.note), None)
+    return state
+
+
+def _set_aside(run_dir: Path, round_index: int) -> None:
+    """Move the rows of a round cut short from `predictions.jsonl` to `interrupted.jsonl`, so that round can be judged again."""
+    path = run_dir / "predictions.jsonl"
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    cut = [json.loads(line)["round"] == round_index for line in lines]
+    with (run_dir / "interrupted.jsonl").open("a", encoding="utf-8") as handle:
+        handle.writelines(line + "\n" for line, is_cut in zip(lines, cut, strict=True) if is_cut)
+    path.write_text("".join(line + "\n" for line, is_cut in zip(lines, cut, strict=True) if not is_cut), encoding="utf-8")
+
+
+def _note_resumption(run_dir: Path, stopped: RoundRecord) -> None:
+    """Add a resumption to `config.json`: when it happened, the round the run stopped in and the failure that stopped it."""
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    entry = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "round": stopped.round, "after": stopped.why_adapted}
+    config["resumed"] = [*config.get("resumed", []), entry]
+    records.write_config(run_dir, config)
+
+
 class Orchestrator:
     """Non-LLM closed-loop coordinator connecting detector, evaluator, attacker, and defender."""
 
@@ -355,8 +497,49 @@ class Orchestrator:
             remaining_attempts=spec.max_attempts,
             max_note_length=spec.max_note_length,
         )
-        history: list[RoundRecord] = []
-        for index in range(1, spec.max_rounds + 1):
+        return self._play(run, state, [], 1)
+
+    def resume_loop(self, flows: Sequence[Flow], examples: Sequence[Flow], spec: AdversarialSpec, run_dir: Path) -> list[RoundRecord]:
+        """Go on with a run that stopped on a failure, in its own folder, as if the failure had not happened.
+
+        After an agent's failure, the round it stopped in was judged and told to both sides, so it is rebuilt from its rows and only its
+        adaptation is asked again, its line rewritten. After the detector stopped answering, the round was cut short and told to nobody,
+        so its rows are set aside in `interrupted.jsonl` and it is judged again from its start. Either way each agent first gets back the
+        session state it held, and the rounds left are played as `run_loop` plays them. The resumption is added to `config.json`.
+
+        Args:
+            flows: the Flows of the split, the same the run judged.
+            examples: the labeled Examples, the same the run used.
+            spec: the spec the run was started with (`spec_of`).
+            run_dir: the run directory, holding the rows and rounds judged before the stop.
+
+        Returns:
+            Every round of the run, those judged before the stop included.
+
+        Raises:
+            ValueError: when the run did not stop on a failure.
+        """
+        history = read_resumable(run_dir)
+        stopped = history.pop()
+        _note_resumption(run_dir, stopped)
+        run = _Run(flows, examples, spec, run_dir, self._run_fields(spec))
+        rows = _rows_by_round(run_dir)
+        cut_short = stopped.why_adapted == DETECTOR_STOPPED
+        told = history if cut_short else [*history, stopped]
+        self.attacker.restore(_told_attacker(run_dir, told, rows, spec))
+        self.defender.restore()
+        state = _resumed_state(run_dir, history, stopped, rows, spec)
+        if cut_short:
+            _set_aside(run_dir, stopped.round)
+            _rewrite_rounds(run_dir, history)
+            return self._play(run, state, history, stopped.round)
+        history.append(self._adapt_again(run, state, stopped, rows[stopped.round]))
+        _rewrite_rounds(run_dir, history)
+        return history if history[-1].who_adapts is None else self._play(run, state, history, stopped.round + 1)
+
+    def _play(self, run: _Run, state: RoundState, history: list[RoundRecord], start: int) -> list[RoundRecord]:
+        """Judge rounds `start` to `max_rounds` from `state`, each added to `history` and `rounds.jsonl`, until one ends the loop."""
+        for index in range(start, run.spec.max_rounds + 1):
             state.round_index = index
             record = self._step_round(run, state)
             history.append(record)
@@ -364,6 +547,15 @@ class Orchestrator:
             if record.who_adapts is None:
                 break
         return history
+
+    def _adapt_again(self, run: _Run, state: RoundState, stopped: RoundRecord, rows: Sequence[Prediction]) -> RoundRecord:
+        """Close the round an agent's failure stopped from where it failed: both sides were told already, so they are only asked."""
+        outcome = _outcome_of(stopped, rows)
+        turn = decide_who_adapts(_evidence(state, outcome), run.spec.noise_margin)
+        adaptation = self._adapt(turn, _feedback(state, outcome), state)
+        state.previous_note, state.previous_verdicts = stopped.note, outcome.evaluation.attack_verdicts
+        state.first_note = state.first_note or stopped.note or None
+        return replace(stopped, **asdict(adaptation))
 
     def _step_round(self, run: _Run, state: RoundState) -> RoundRecord:
         """One round: put the instructions in force, judge every Flow, tell each side what it may know, let one side adapt."""
@@ -422,15 +614,7 @@ class Orchestrator:
         feedback = self._deliver(state, outcome)
         if state.round_index >= spec.max_rounds:
             return Adaptation(why_adapted=MAX_ROUNDS_REACHED)
-        counts = outcome.evaluation.counts
-        evidence = Evidence(
-            first_round=state.previous_verdicts is None,
-            attacks_detected=counts.attacks_detected,
-            attacks_passed=counts.attacks_passed,
-            shift=outcome.shift,
-            note_unchanged=state.note == state.previous_note,
-        )
-        return self._adapt(decide_who_adapts(evidence, spec.noise_margin), feedback, state)
+        return self._adapt(decide_who_adapts(_evidence(state, outcome), spec.noise_margin), feedback, state)
 
     def _deliver(self, state: RoundState, outcome: _Outcome) -> _Feedback:
         """Build each side's observation once and hand it over.
@@ -438,26 +622,7 @@ class Orchestrator:
         The attacker gets counts over its own attack records and nothing about the defense. The defender gets the aggregate counts,
         the instructions in force and the notes that were tested.
         """
-        counts, shift = outcome.evaluation.counts, outcome.shift
-        feedback = _Feedback(
-            attacker=AttackerObservation(
-                round_index=state.round_index,
-                note_used=state.note,
-                attempts=counts.attacks_detected + counts.attacks_passed,
-                alerts=counts.attacks_detected,
-                newly_alerted=shift.newly_alerted,
-                newly_passing=shift.newly_passing,
-                remaining_attempts=state.remaining_attempts,
-                max_note_length=state.max_note_length,
-            ),
-            defender=DefenderObservation(
-                round_index=state.round_index,
-                instruction_label=outcome.version.label,
-                instructions=state.instructions,
-                notes_tested=outcome.evaluation.notes_tested,
-                **asdict(counts),
-            ),
-        )
+        feedback = _feedback(state, outcome)
         self.attacker.observe(feedback.attacker)
         self.defender.observe(feedback.defender)
         return feedback
@@ -519,6 +684,8 @@ class Orchestrator:
         config_payload = {
             "mode": "adversarial",
             "detector": self.detector.name,
+            # Keeping the `--detector` the run was started with apart from the name the detector gives itself, for `spec_of`.
+            "requested_detector": spec.detector,
             "detector_model": self.detector.model,
             "attacker_provider": spec.attacker_provider,
             "attacker_model": spec.attacker_model,
@@ -556,17 +723,22 @@ def check_detector_name(name: str) -> None:
         raise ValueError(f"detector {name!r} does not support dynamic instructions")
 
 
-def run_adversarial(spec: AdversarialSpec) -> tuple[Path, list[RoundRecord]]:
-    """High-level entry point loading dataset, detector, and Agno agents to run a closed loop.
+@dataclass(frozen=True)
+class _Setup:
+    """What a run loads before its first round: the card, the Flows, the Examples, the detector and the agents' checked models."""
 
-    Each agent's model answers one trivial question before the first round, asked with the schema its decisions use, so a bad key
-    or a request the provider refuses ends the run before any detector call.
+    config: Config
+    flows: list[Flow]
+    examples: list[Flow]
+    detector: DecisionDetector
+    models: dict[str, Any]
 
-    Args:
-        spec: the resolved run.
 
-    Returns:
-        The run directory and one record per round judged.
+def _prepare(spec: AdversarialSpec) -> _Setup:
+    """Load the card, the Flows and the Examples, build the detector, and ask each agent's model one trivial question.
+
+    The question is asked with the schema the agent's decisions use, so a bad key or a request the provider refuses ends the run
+    before any detector call.
 
     Raises:
         ValueError: when the detector's instructions cannot be rewritten.
@@ -596,15 +768,82 @@ def run_adversarial(spec: AdversarialSpec) -> tuple[Path, list[RoundRecord]]:
     schemas = {ATTACKER: AttackerDecision, DEFENDER: DefenderDecision}
     for role, model in models.items():
         check_agent_model(model, role, schemas[role])
-    stamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M%S")
-    # Naming the directory without the colon of `llm:<provider>`, which is not a path character on Windows.
-    out_dir = spec.results_dir / f"adv_{config['name']}_{spec.detector.replace(':', '-')}_{stamp}"
-    memory_dir = spec.memory_dir or out_dir / "memory"
-    base = detector.instructions
-    attacker = AttackerAgent(models[ATTACKER], memory_dir)
-    defender = DefenderAgent(models[DEFENDER], memory_dir, base, reinforce_instructions(base))
+    return _Setup(config, flows, examples, detector, models)
+
+
+def _with_agents(setup: _Setup, memory_dir: Path, reopen: bool, play: Callable[[Orchestrator], list[RoundRecord]]) -> list[RoundRecord]:
+    """Open both agents on `memory_dir`, let `play` drive the orchestrator, and release the agents' SQLite files whatever happens."""
+    base = setup.detector.instructions
+    attacker = AttackerAgent(setup.models[ATTACKER], memory_dir, reopen=reopen)
+    defender = DefenderAgent(setup.models[DEFENDER], memory_dir, base, reinforce_instructions(base), reopen=reopen)
     try:
-        return out_dir, Orchestrator(detector, attacker, defender, config).run_loop(flows, examples, spec, out_dir=out_dir)
+        return play(Orchestrator(setup.detector, attacker, defender, setup.config))
     finally:
         attacker.memory.close()
         defender.memory.close()
+
+
+def run_adversarial(spec: AdversarialSpec) -> tuple[Path, list[RoundRecord]]:
+    """High-level entry point loading dataset, detector, and Agno agents to run a closed loop.
+
+    Each agent's model answers one trivial question before the first round (`_prepare`).
+
+    Args:
+        spec: the resolved run.
+
+    Returns:
+        The run directory and one record per round judged.
+
+    Raises:
+        ValueError: when the detector's instructions cannot be rewritten.
+        AgentUnavailableError: when an agent's model fails its trivial question.
+    """
+    setup = _prepare(spec)
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M%S")
+    # Naming the directory without the colon of `llm:<provider>`, which is not a path character on Windows.
+    out_dir = spec.results_dir / f"adv_{setup.config['name']}_{spec.detector.replace(':', '-')}_{stamp}"
+    memory_dir = spec.memory_dir or out_dir / "memory"
+    history = _with_agents(setup, memory_dir, False, lambda loop: loop.run_loop(setup.flows, setup.examples, spec, out_dir=out_dir))
+    return out_dir, history
+
+
+def spec_of(run_dir: Path) -> AdversarialSpec:
+    """The spec a run was started with, read back from its `config.json`; the card is the dataset's under `data/`."""
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    return AdversarialSpec(
+        # Reading the detector's own name in a run started before `requested_detector` was recorded: each is named after its option.
+        detector=config.get("requested_detector", config["detector"]),
+        dataset=ROOT / "data" / config["dataset"] / "dataset.json",
+        split=config["split"],
+        attacker_provider=config["attacker_provider"],
+        attacker_model=config["attacker_model"],
+        defender_provider=config["defender_provider"],
+        defender_model=config["defender_model"],
+        detector_model=config["detector_model"],
+        max_rounds=config["max_rounds"],
+        max_attempts=config["max_attempts"],
+        max_note_length=config["max_note_length"],
+        initial_note=config["initial_note"],
+        k=config["k"],
+        seed=config["seed"],
+        record=config["record"],
+        results_dir=run_dir.parent,
+        noise_margin=config["noise_margin"],
+        memory_dir=run_dir / config["memory_dir"],
+    )
+
+
+def resume_adversarial(run_dir: Path) -> tuple[Path, list[RoundRecord]]:
+    """Go on with a run that stopped on a failure, in its own folder (`Orchestrator.resume_loop`), with the spec it started with.
+
+    The agents reopen the sessions they last ran in, after each model answers the trivial question, as at the start of a run.
+
+    Raises:
+        ValueError: when the run did not stop on a failure.
+        AgentUnavailableError: when an agent's model fails its trivial question.
+    """
+    read_resumable(run_dir)
+    spec = spec_of(run_dir)
+    setup = _prepare(spec)
+    memory_dir = spec.memory_dir or run_dir / "memory"
+    return run_dir, _with_agents(setup, memory_dir, True, lambda loop: loop.resume_loop(setup.flows, setup.examples, spec, run_dir))

@@ -17,7 +17,9 @@ from jev_ids.dataset import Config
 from jev_ids.detectors.llm import extract_overview, replace_overview
 from jev_ids.evaluator import DETECTOR_FAILURE_LIMIT, normalize_wording, sanitize_note
 from tests.adversarial_helpers import (
+    ATTACKER_SCRIPT,
     BASE_INSTRUCTIONS,
+    DEFENDER_SCRIPT,
     LOUD,
     NSL_KDD_CARD,
     REINFORCED_INSTRUCTIONS,
@@ -30,13 +32,10 @@ from tests.adversarial_helpers import (
     attacker_says,
     defender_says,
     make_spec,
+    read_jsonl,
     study_flow,
 )
 
-# Scripting the canonical cycle: the defender reinforces and later relaxes, the attacker removes its note and later rewrites it.
-# The labels the defender's model writes are wrong on purpose, because the loop must not read them.
-ATTACKER_SCRIPT = [attacker_says("remove"), attacker_says("reformulate", "ticket-4821")]
-DEFENDER_SCRIPT = [defender_says("reinforce", label="V9"), defender_says("relax", label="R")]
 SMOKE_ROW_IDS = (11867, 20816, 20967, 10273, 17034)
 # Typing what a scripted model answers with, and the script of a model that is never asked.
 Script = list[str | Exception]
@@ -55,13 +54,6 @@ class Played:
 def column(history: Sequence[RoundRecord], name: str) -> list[Any]:
     """One field of every round, in order."""
     return [getattr(record, name) for record in history]
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """The lines of a JSONL file as dicts; an absent file has none."""
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def play(loop: Loop, root: Path, flows: Sequence[Any] = STUDY_FLOWS, **spec: Any) -> Played:
@@ -322,6 +314,37 @@ def test_cli_writes_the_attempts_left_and_a_memory_folder_relative_to_the_run_di
     # The attacker is never given a turn, so its budget of three attempts stays whole, in the file and in the CSV the command prints.
     assert column([RoundRecord(**line) for line in read_jsonl(run_dir / "rounds.jsonl")], "attempts_left") == [3, 3]
     assert [row["attempts_left"] for row in csv.DictReader(stdout.splitlines())] == ["3", "3"]
+
+
+def test_cli_resume_goes_on_with_a_run_an_agent_outage_stopped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Round 1 gives the defender the turn while its model is down; going on, it reinforces, and round 2 is the last.
+    install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK", RuntimeError("503 overloaded")])
+    with pytest.raises(SystemExit, match="agent_unavailable:defender at round 1 .*`jev-ids resume "):
+        cli.main(cli_args(tmp_path, "--rounds", "2", "--noise-margin", "1"))
+    (run_dir,) = tmp_path.glob("adv_nsl-kdd_jev_*")
+    capsys.readouterr()
+    install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK", defender_says("reinforce")])
+    assert cli.main(["resume", str(run_dir)]) == 0
+    rows = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+    assert [(row["state_code"], row["who_adapts"]) for row in rows] == [("N/B", "defender"), ("N/R", "")]
+    assert [RoundRecord(**line).state_code for line in read_jsonl(run_dir / "rounds.jsonl")] == ["N/B", "N/R"]
+
+
+def test_cli_resume_refuses_a_run_that_ended_in_order_and_a_model_that_fails_first(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _, run_dir = run_two_rounds(monkeypatch, capsys, tmp_path)
+    with pytest.raises(SystemExit, match="did not stop on a failure"):
+        cli.main(["resume", str(run_dir)])
+    install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK", RuntimeError("503 overloaded")])
+    with pytest.raises(SystemExit, match="agent_unavailable:defender at round 1"):
+        cli.main(cli_args(tmp_path / "again", "--rounds", "2", "--noise-margin", "1"))
+    (stopped,) = (tmp_path / "again").glob("adv_nsl-kdd_jev_*")
+    install_doubles(monkeypatch, MockDecisionDetector(), [RuntimeError("401 invalid key")], ["OK"])
+    with pytest.raises(SystemExit, match="unavailable before going on, no detector call was made"):
+        cli.main(["resume", str(stopped)])
 
 
 def test_cli_names_the_run_folder_without_the_colon_of_an_llm_detector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

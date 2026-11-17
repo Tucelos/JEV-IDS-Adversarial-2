@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 from agno.agent import Agent
+from agno.db.base import SessionType
 from agno.db.sqlite import SqliteDb
 from agno.learn import DecisionLogConfig, LearningMachine, LearningMode, UserMemoryConfig
 from agno.learn.schemas import DecisionLog
@@ -192,7 +193,11 @@ def check_agent_model(model: Any, role: str, output_schema: type[BaseModel] | No
 
 @dataclass(frozen=True)
 class AgentBundle:
-    """Runtime settings used to wire an Agno agent and its private memory."""
+    """Runtime settings used to wire an Agno agent and its private memory.
+
+    Attributes:
+        reopen: go on with the session the role last ran in on its file, as a resumed run does, instead of opening a new one.
+    """
 
     role: str
     model: Any
@@ -200,6 +205,7 @@ class AgentBundle:
     output_schema: type[BaseModel]
     initial_state: dict[str, Any]
     memory_dir: Path
+    reopen: bool = False
 
 
 def _parse_schema_output[T: BaseModel](content: Any, schema: type[T]) -> T:
@@ -227,6 +233,10 @@ class AgentMemory:
         # the session once, at the first run, and a change made to it afterwards would never reach the model.
         self.state = bundle.initial_state
         self.db = SqliteDb(db_file=str(bundle.memory_dir / f"{bundle.role}.db"))
+        # Going on, in a resumed run, with the session the role last ran in, so the model reads the history it read before the stop;
+        # Agno leaves a run that ended in error out of that history.
+        reopened = self._latest_session_id() if bundle.reopen else None
+        self.session_id = reopened or f"{bundle.role}-{uuid.uuid4().hex[:8]}"
         # Switching each memory tool off by its own flag, because in AGENTIC mode Agno hands them to the model whatever
         # `enable_agent_tools` says. The memory is written by this module alone: a tool call would be a model call the loop
         # never asked for, and `update_user_memory` could rewrite or delete the feedback recorded here.
@@ -247,7 +257,7 @@ class AgentMemory:
             model=bundle.model,
             db=self.db,
             user_id=bundle.role,
-            session_id=f"{bundle.role}-{uuid.uuid4().hex[:8]}",
+            session_id=self.session_id,
             session_state=bundle.initial_state,
             add_session_state_to_context=True,
             add_history_to_context=True,
@@ -260,6 +270,13 @@ class AgentMemory:
             retries=0,
             telemetry=False,
         )
+
+    def _latest_session_id(self) -> str | None:
+        """The session this role last ran in on its file, or None when it never ran there."""
+        sessions: Any = self.db.get_sessions(
+            session_type=SessionType.AGENT, component_id=self.role, sort_by="created_at", sort_order="desc", limit=1, include_runs=False
+        )
+        return sessions[0].session_id if sessions else None
 
     def remember(self, summary: str) -> None:
         """Add one line of feedback to the user memory, which Agno shows the model on every later run."""

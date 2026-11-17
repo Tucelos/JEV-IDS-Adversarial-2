@@ -139,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     tuner.set_defaults(handler=threshold_command)
 
     _add_adversarial_parser(commands)
+    resumer = commands.add_parser("resume", help="go on with an adversarial run that stopped on a failure, from the round it stopped in")
+    resumer.add_argument("run_dir", type=Path, help="results/adv_* directory of the run that stopped")
+    resumer.set_defaults(handler=resume_command)
     return parser
 
 
@@ -265,10 +268,33 @@ def adversarial_command(args: argparse.Namespace) -> None:
         run_dir, history = adversarial.run_adversarial(spec)
     except AgentUnavailableError as exc:
         raise SystemExit(f"agent model unavailable before the first round, no detector call was made ({exc})") from exc
+    report_rounds(run_dir, history)
+
+
+def resume_command(args: argparse.Namespace) -> None:
+    """`resume`: go on with an adversarial run that stopped on a failure, and print every round of it as `adversarial` does.
+
+    The command exits non-zero when the run did not stop on a failure, when an agent's model fails its question before going on, and,
+    after the rounds are printed, when the loop stopped again.
+    """
+    try:
+        run_dir, history = adversarial.resume_adversarial(args.run_dir)
+    except AgentUnavailableError as exc:
+        raise SystemExit(f"agent model unavailable before going on, no detector call was made ({exc})") from exc
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    report_rounds(run_dir, history)
+
+
+def report_rounds(run_dir: Path, history: Sequence[adversarial.RoundRecord]) -> None:
+    """Print one CSV row per round, then exit non-zero, naming the way to go on, when the loop stopped on a failure."""
     print_csv([asdict(rec) for rec in history])
     failure = adversarial.failure_of(history)
     if failure is not None:
-        raise SystemExit(f"stopped: {failure} at round {history[-1].round} of {run_dir}; the rows judged so far are kept")
+        raise SystemExit(
+            f"stopped: {failure} at round {history[-1].round} of {run_dir}; the rows judged so far are kept, "
+            f"and `jev-ids resume {run_dir}` goes on from that round"
+        )
 
 
 def read_runs(run_dirs: Sequence[Path], threshold: float | None = None) -> list[Prediction]:
