@@ -4,9 +4,9 @@ Run from the repository root, in a terminal of its own, and stop it with Ctrl+C 
 
     uv run python -m scripts.watch_adversarial
 
-It follows the newest `results/adv_*` run and, when that run ends, waits for the next one, so a chain of runs (one detector
-after the other) is followed from end to end. It only reads the files a run writes (`config.json`, `rounds.jsonl` and
-`predictions.jsonl`), so starting or stopping it never touches the run or its calls.
+It follows the `results/adv_*` run that started or was resumed last and, when that run ends, waits for the next one, so a
+chain of runs (one detector after the other) is followed from end to end. It only reads the files a run writes (`config.json`,
+`rounds.jsonl` and `predictions.jsonl`), so starting or stopping it never touches the run or its calls.
 """
 
 import argparse
@@ -40,9 +40,15 @@ def read_config(run_dir: Path) -> dict[str, Any]:
 
 
 def newest_run(results_dir: Path) -> Path | None:
-    """The adversarial run that started last, by the `started_at` of its `config.json`; None while there is none."""
+    """The adversarial run that started or was resumed last, by its `config.json`; None while there is none."""
     runs = [path.parent for path in results_dir.glob("adv_*/config.json")]
-    return max(runs, key=lambda run_dir: str(read_config(run_dir).get("started_at", "")), default=None)
+    return max(runs, key=last_start, default=None)
+
+
+def last_start(run_dir: Path) -> str:
+    """When a run last started playing: its `started_at`, or the `at` of its latest resumption, both in UTC."""
+    config = read_config(run_dir)
+    return max([str(config.get("started_at", "")), *(str(entry["at"]) for entry in config.get("resumed", []))])
 
 
 def read_lines(path: Path) -> list[dict[str, Any]]:
