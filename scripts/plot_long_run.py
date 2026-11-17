@@ -134,9 +134,10 @@ def plot_trajectory(run: Run, path: Path) -> None:
     plt.close(figure)
 
 
-def phase_size(run: Run) -> int:
-    """How many rounds each phase holds: PHASE_ROUNDS, fewer when the run is too short for two phases that never overlap."""
-    return max(1, min(PHASE_ROUNDS, len(run.rows) // 2))
+def phases(run: Run) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+    """The size of a phase, then the first and the last rounds of `run`: PHASE_ROUNDS each, fewer when two would overlap."""
+    size = max(1, min(PHASE_ROUNDS, len(run.rows) // 2))
+    return size, run.rows[:size], run.rows[-size:]
 
 
 def phase_mean(rows: list[dict[str, Any]], column: str) -> float:
@@ -146,8 +147,7 @@ def phase_mean(rows: list[dict[str, Any]], column: str) -> float:
 
 def draw_phase_bars(axis: Any, run: Run) -> None:
     """Two bars per metric, the first and the last rounds of `run`, each labelled with its value."""
-    size = phase_size(run)
-    first, last = run.rows[:size], run.rows[-size:]
+    size, first, last = phases(run)
     positions = list(range(len(METRICS)))
     width = 0.38
     early_values = [phase_mean(first, column) for column, _ in METRICS]
@@ -188,6 +188,13 @@ def describe(run: Run) -> str:
     )
 
 
+def describe_phases(run: Run) -> str:
+    """One line with each metric's mean over the first and the last rounds of `run`, as the README quotes them."""
+    size, first, last = phases(run)
+    parts = [f"{title} {phase_mean(first, column):.2f} -> {phase_mean(last, column):.2f}" for column, title in METRICS]
+    return f"{run.label}, first {size} -> last {size} rounds: " + "; ".join(parts)
+
+
 def parse_args() -> argparse.Namespace:
     """The command line: the run folders, one per detector, and where to write."""
     parser = argparse.ArgumentParser(description="draw the long adversarial runs")
@@ -205,6 +212,7 @@ def main() -> None:
     for run in runs:
         plot_trajectory(run, args.out_dir / f"laco_longo_{run.detector}.png")
         print(describe(run))
+        print(describe_phases(run))
     plot_improvement(runs, args.out_dir / "laco_longo_melhora.png")
 
 
