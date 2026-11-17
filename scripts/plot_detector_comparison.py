@@ -20,11 +20,7 @@ import csv
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402  (the Agg backend must be chosen before pyplot is imported)
-from matplotlib.patches import Rectangle  # noqa: E402  (same reason: imported after the backend is set)
+from scripts.plotting import WHO_COLORS, patches, plt
 
 COMPARISON_DIR = Path("results/comparison")
 CSV_PATH = COMPARISON_DIR / "detector_comparison.csv"
@@ -41,8 +37,6 @@ PANELS: tuple[tuple[str, str], ...] = (
 )
 # The run section 6.1 reads round by round: the core loop with a single detector.
 LOOP_DETECTOR = "gemini_decision/gemini-decision-1"
-# Who the orchestrator chose to adapt after a round, in the colours the loop diagrams use: green defender, red attacker, grey end.
-WHO_COLORS: dict[str, str] = {"defender": "#2ca02c", "attacker": "#d62728", "": "#9e9e9e"}
 WHO_LABELS: dict[str, str] = {"defender": "defensor", "attacker": "atacante", "": "fim"}
 
 
@@ -127,7 +121,7 @@ def draw_adaptation_strip(axis: Any, rows: list[dict[str, Any]]) -> None:
     for row in rows:
         position = int(row["round"])
         who = row["who_adapts"]
-        axis.add_patch(Rectangle((position - 0.45, 0.0), 0.9, 1.0, color=WHO_COLORS.get(who, "#9e9e9e")))
+        axis.add_patch(patches.Rectangle((position - 0.45, 0.0), 0.9, 1.0, color=WHO_COLORS.get(who, "#9e9e9e")))
         axis.text(position, 0.5, WHO_LABELS.get(who, who), ha="center", va="center", fontsize=8, color="white", fontweight="bold")
     axis.set_ylim(0.0, 1.0)
     axis.set_yticks([])
@@ -138,10 +132,23 @@ def plot_loop_round_by_round(rows: list[dict[str, Any]], out_path: Path) -> None
     """One run read round by round: detection and false alarm across the rounds, who adapts shown under each round."""
     figure, (top, strip) = plt.subplots(2, 1, figsize=(9.5, 6.0), height_ratios=[6, 1], sharex=True)
     xs = [int(row["round"]) for row in rows]
-    top.plot(xs, [float(row["detection_rate"]) for row in rows], marker="o", color="#0072B2", linewidth=2.2,
-             label="Taxa de detecção (ataques capturados)")
-    top.plot(xs, [float(row["false_alarm_rate"]) for row in rows], marker="s", linestyle="--", color="#555555", linewidth=1.8,
-             label="Taxa de falso alarme (usuário legítimo)")
+    top.plot(
+        xs,
+        [float(row["detection_rate"]) for row in rows],
+        marker="o",
+        color="#0072B2",
+        linewidth=2.2,
+        label="Taxa de detecção (ataques capturados)",
+    )
+    top.plot(
+        xs,
+        [float(row["false_alarm_rate"]) for row in rows],
+        marker="s",
+        linestyle="--",
+        color="#555555",
+        linewidth=1.8,
+        label="Taxa de falso alarme (usuário legítimo)",
+    )
     top.set_xlim(0.5, len(rows) + 0.5)
     top.set_ylim(-0.05, 1.05)
     top.set_ylabel("proporção")
