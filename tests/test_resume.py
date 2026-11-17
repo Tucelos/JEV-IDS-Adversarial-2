@@ -1,19 +1,20 @@
-"""Going on with an adversarial run that stopped on a failure: it picks up the round it stopped in and ends as if it never stopped.
+"""Going on with an adversarial run that stopped before its end: it picks up the round it stopped in and ends as if it never stopped.
 
-Each test plays the canonical cycle twice, under two folders: once straight, once stopped by a failure and resumed by new agents
-on the same memory folder, as a new process would. The resumed run must leave the same records, rows and agent states as the
-straight one.
+Each test plays the canonical cycle twice, under two folders: once straight, once stopped, by a failure or by its process going down,
+and resumed by new agents on the same memory folder, as a new process would. The resumed run must leave the same records, rows and
+agent states as the straight one.
 """
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from jev_ids.adversarial import RoundRecord, failure_of, read_resumable, read_rounds
+from jev_ids.adversarial import ROUND_IN_PLAY, RoundRecord, failure_of, read_resumable, read_rounds
+from jev_ids.dataset import Flow
 from tests.adversarial_helpers import (
     ATTACKER_SCRIPT,
     DEFENDER_SCRIPT,
@@ -28,6 +29,23 @@ from tests.adversarial_helpers import (
 
 # What TokenLab answered while its model service was down, raised by a scripted model as the provider raised it.
 OUTAGE = RuntimeError("503 The model service is temporarily unavailable. Please retry shortly.")
+
+
+class Killed(BaseException):
+    """The process going down: nothing in the loop catches it, as nothing catches a power cut."""
+
+
+class DyingDetector(MockDecisionDetector):
+    """The mock detector, whose process goes down at its `die_at`-th call, before answering it."""
+
+    def __init__(self, die_at: int) -> None:
+        super().__init__()
+        self.die_at = die_at
+
+    def predict(self, flow: Flow, examples: Sequence[Flow]) -> dict[str, Any]:
+        if self.calls + 1 == self.die_at:
+            raise Killed
+        return super().predict(flow, examples)
 
 
 def run_dir_of(agents: AgentFactory) -> Path:
@@ -141,7 +159,51 @@ def test_a_round_the_detector_cut_short_is_set_aside_and_judged_again(straight: 
     assert resumptions(run_dir) == [(1, "detector_stopped")]
 
 
+@pytest.mark.parametrize("saved_start", [True, False])
+def test_a_run_cut_off_while_the_detector_judged_judges_that_round_again(
+    straight: AgentFactory, broken: AgentFactory, saved_start: bool
+) -> None:
+    expected = play(straight.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT), straight)
+    # Rounds 1 and 2 make ten calls; the process goes down on the fourth call of round 3, after two benign rows and one attack row.
+    with pytest.raises(Killed):
+        play(broken.loop(ATTACKER_SCRIPT[:1], DEFENDER_SCRIPT[:1], DyingDetector(die_at=14)), broken)
+    run_dir = run_dir_of(broken)
+    if not saved_start:
+        # A run started before the start of each round was saved goes on from the cut round's own attack row.
+        (run_dir / ROUND_IN_PLAY).unlink()
+    broken.restart()
+    assert resume(broken.loop(ATTACKER_SCRIPT[1:], DEFENDER_SCRIPT[1:], reopen=True), broken) == expected
+    assert [row["round"] for row in read_jsonl(run_dir / "interrupted.jsonl")] == [3, 3, 3]
+    assert len(read_jsonl(run_dir / "predictions.jsonl")) == len(STUDY_FLOWS) * len(expected)
+    assert resumptions(run_dir) == [(3, "cut_off")]
+
+
+def test_a_run_cut_off_while_a_side_was_deciding_asks_that_side_again(
+    straight: AgentFactory, broken: AgentFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = play(straight.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT), straight)
+    loop = broken.loop([], DEFENDER_SCRIPT[:1])
+    # Reading the method by name, as `monkeypatch` replaces it by name.
+    adapt = getattr(loop.orchestrator, "_adapt")  # noqa: B009
+
+    def adapt_until_round_two(turn: Any, feedback: Any, state: Any) -> Any:
+        if state.round_index == 2:
+            raise Killed
+        return adapt(turn, feedback, state)
+
+    monkeypatch.setattr(loop.orchestrator, "_adapt", adapt_until_round_two)
+    with pytest.raises(Killed):
+        play(loop, broken)
+    broken.restart()
+    assert resume(broken.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT[1:], reopen=True), broken) == expected
+    run_dir = run_dir_of(broken)
+    # Round 2 was judged in full and told to both sides, so nothing is set aside and no call is made twice.
+    assert not (run_dir / "interrupted.jsonl").exists()
+    assert len(read_jsonl(run_dir / "predictions.jsonl")) == len(STUDY_FLOWS) * len(expected)
+    assert resumptions(run_dir) == [(2, "cut_off")]
+
+
 def test_a_run_that_ended_in_order_is_not_resumed(straight: AgentFactory) -> None:
     play(straight.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT), straight)
-    with pytest.raises(ValueError, match="did not stop on a failure"):
+    with pytest.raises(ValueError, match="ended in order"):
         read_resumable(run_dir_of(straight))

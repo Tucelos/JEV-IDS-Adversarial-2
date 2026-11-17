@@ -60,6 +60,10 @@ STABLE = "stable"
 DETECTOR_STOPPED = "detector_stopped"
 AGENT_UNAVAILABLE = "agent_unavailable"
 MAX_ROUNDS_REACHED = "max_rounds_reached"
+# Naming a resumption after the run's process stopped mid-round, with no line of `rounds.jsonl` to say why.
+CUT_OFF = "cut_off"
+# Keeping how the round in play started, which a run cut off before the round's line cannot read back from `rounds.jsonl`.
+ROUND_IN_PLAY = "round_in_play.json"
 # Listing the detectors whose instructions the defender can rewrite, besides every `llm:<provider>`.
 DECISION_DETECTORS = ("jev", "gemini_decision", "systemone")
 
@@ -364,15 +368,81 @@ def read_rounds(run_dir: Path) -> list[RoundRecord]:
 
 
 def read_resumable(run_dir: Path) -> list[RoundRecord]:
-    """The rounds of a run that stopped on a failure, the stopped one last.
+    """The rounds of a run that stopped before its end: on a failure, the stopped round last, or cut off in the middle of a round.
 
     Raises:
-        ValueError: when the run recorded no round, or ended in order, on its last round or with both sides holding.
+        ValueError: when the run ended in order, on its last round or with both sides holding.
     """
     history = read_rounds(run_dir)
-    if failure_of(history) is None:
-        raise ValueError(f"{run_dir.name} did not stop on a failure, so there is nothing to resume")
+    if history and failure_of(history) is None and history[-1].who_adapts is None:
+        raise ValueError(f"{run_dir.name} ended in order ({history[-1].why_adapted}), so there is nothing to resume")
     return history
+
+
+@dataclass(frozen=True)
+class _RoundStart:
+    """How a round started: its note, the version in force, the attempts left, and how many rounds the defender had been told of."""
+
+    round: int
+    note: str
+    instruction_label: str
+    instructions_sha256: str
+    remaining_attempts: int
+    told_before: int | None = None
+
+    @classmethod
+    def of(cls, record: RoundRecord) -> _RoundStart:
+        """The start of a recorded round."""
+        return cls(record.round, record.note, record.instruction_label, record.instructions_sha256, record.attempts_left)
+
+
+@dataclass
+class _Resumption:
+    """Where a stopped run goes on from.
+
+    Attributes:
+        run_dir: the run directory.
+        history: the rounds recorded before the stopped one.
+        rows: every row of the run, by round.
+        start: how the stopped round started.
+        judged: the stopped round's line when both sides were told of it, None when it is judged again.
+    """
+
+    run_dir: Path
+    history: list[RoundRecord]
+    rows: dict[int, list[Prediction]]
+    start: _RoundStart
+    judged: RoundRecord | None
+
+
+def _save_round_in_play(run_dir: Path | None, state: RoundState, version: _Version, told_before: int) -> None:
+    """Write how the round in play starts, which a run cut off before the round's line cannot read back from `rounds.jsonl`."""
+    if run_dir is None:
+        return
+    start = _RoundStart(state.round_index, state.note, version.label, version.sha256, state.remaining_attempts, told_before)
+    (run_dir / ROUND_IN_PLAY).write_text(json.dumps(asdict(start), ensure_ascii=False), encoding="utf-8")
+
+
+def _round_start(run_dir: Path, history: Sequence[RoundRecord], rows: dict[int, list[Prediction]], spec: AdversarialSpec) -> _RoundStart:
+    """How the round a cut-off run was playing started: from `round_in_play.json`, or, in a run that wrote none, from its rows.
+
+    Raises:
+        ValueError: when neither tells, as when the process stopped before the round wrote its first attack row.
+    """
+    in_play = history[-1].round + 1 if history else 1
+    path = run_dir / ROUND_IN_PLAY
+    saved = _RoundStart(**json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
+    if saved is not None and saved.round == in_play:
+        return saved
+    attack = next((row for row in rows.get(in_play, []) if row["is_attack"]), None)
+    if attack is None:
+        raise ValueError(f"round {in_play} was cut off before anything recorded how it started, so it cannot be resumed")
+    note: str = attack["note"]
+    if not history:
+        return _RoundStart(in_play, note, attack["instruction_label"], attack["instructions_sha256"], spec.max_attempts)
+    # A new wording put in force after the previous round spent one attempt, as `_attacker_move` counts it.
+    spent = int(bool(note) and note != history[-1].note)
+    return _RoundStart(in_play, note, attack["instruction_label"], attack["instructions_sha256"], history[-1].attempts_left - spent)
 
 
 def _rewrite_rounds(run_dir: Path, history: Sequence[RoundRecord]) -> None:
@@ -395,22 +465,41 @@ def _outcome_of(record: RoundRecord, rows: Sequence[Prediction]) -> _Outcome:
     return _Outcome(version, summarize_rows(rows, record.note), Shift(record.newly_alerted, record.newly_passing))
 
 
-def _instructions_of(run_dir: Path, record: RoundRecord) -> str:
+def _instructions_of(run_dir: Path, start: _RoundStart) -> str:
     """The instructions a round was judged under, read from their file, which must still hash to the round's sha256."""
-    payload = (run_dir / "instructions" / f"{record.instruction_label}.txt").read_bytes()
-    if hashlib.sha256(payload).hexdigest() != record.instructions_sha256:
-        raise ValueError(f"instructions/{record.instruction_label}.txt no longer matches round {record.round}")
+    payload = (run_dir / "instructions" / f"{start.instruction_label}.txt").read_bytes()
+    if hashlib.sha256(payload).hexdigest() != start.instructions_sha256:
+        raise ValueError(f"instructions/{start.instruction_label}.txt no longer matches round {start.round}")
     return payload.decode("utf-8")
 
 
-def _judged_state(run_dir: Path, record: RoundRecord, spec: AdversarialSpec) -> RoundState:
-    """The state a recorded round was judged from: its note, its instructions, the attempts it left and the longest note allowed."""
+def _judged_state(run_dir: Path, start: _RoundStart, spec: AdversarialSpec) -> RoundState:
+    """The state a round was judged from: its note, its instructions, the attempts it left and the longest note allowed."""
     return RoundState(
-        round_index=record.round,
-        note=record.note,
-        instructions=_instructions_of(run_dir, record),
-        remaining_attempts=record.attempts_left,
+        round_index=start.round,
+        note=start.note,
+        instructions=_instructions_of(run_dir, start),
+        remaining_attempts=start.remaining_attempts,
         max_note_length=spec.max_note_length,
+    )
+
+
+def _judged_record(state: RoundState, outcome: _Outcome, code: str) -> RoundRecord:
+    """The line of a round as judged, before any side adapts: what the round started from and what it measured."""
+    evaluation, shift = outcome.evaluation, outcome.shift
+    return RoundRecord(
+        round=state.round_index,
+        state_code=code,
+        note=state.note,
+        instruction_label=outcome.version.label,
+        instructions_sha256=outcome.version.sha256,
+        newly_alerted=shift.newly_alerted,
+        newly_passing=shift.newly_passing,
+        attempts_left=state.remaining_attempts,
+        f1=evaluation.f1,
+        false_alarm_rate=evaluation.false_alarm_rate,
+        **asdict(evaluation.counts),
+        **asdict(Adaptation()),
     )
 
 
@@ -418,14 +507,16 @@ def _told_attacker(
     run_dir: Path, told: Sequence[RoundRecord], rows: dict[int, list[Prediction]], spec: AdversarialSpec
 ) -> list[AttackerObservation]:
     """What the attacker was told of each round in `told`, rebuilt from the round's line and rows as `_feedback` built it then."""
-    return [_feedback(_judged_state(run_dir, record, spec), _outcome_of(record, rows[record.round])).attacker for record in told]
+    return [
+        _feedback(_judged_state(run_dir, _RoundStart.of(record), spec), _outcome_of(record, rows[record.round])).attacker for record in told
+    ]
 
 
 def _resumed_state(
-    run_dir: Path, history: Sequence[RoundRecord], stopped: RoundRecord, rows: dict[int, list[Prediction]], spec: AdversarialSpec
+    run_dir: Path, history: Sequence[RoundRecord], start: _RoundStart, rows: dict[int, list[Prediction]], spec: AdversarialSpec
 ) -> RoundState:
     """The state the stopped round was judged from, with the previous round's note and verdicts the turn rule compares it with."""
-    state = _judged_state(run_dir, stopped, spec)
+    state = _judged_state(run_dir, start, spec)
     if history:
         previous = history[-1]
         state.previous_note = previous.note
@@ -437,6 +528,8 @@ def _resumed_state(
 def _set_aside(run_dir: Path, round_index: int) -> None:
     """Move the rows of a round cut short from `predictions.jsonl` to `interrupted.jsonl`, so that round can be judged again."""
     path = run_dir / "predictions.jsonl"
+    if not path.exists():
+        return
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     cut = [json.loads(line)["round"] == round_index for line in lines]
     with (run_dir / "interrupted.jsonl").open("a", encoding="utf-8") as handle:
@@ -444,10 +537,10 @@ def _set_aside(run_dir: Path, round_index: int) -> None:
     path.write_text("".join(line + "\n" for line, is_cut in zip(lines, cut, strict=True) if not is_cut), encoding="utf-8")
 
 
-def _note_resumption(run_dir: Path, stopped: RoundRecord) -> None:
-    """Add a resumption to `config.json`: when it happened, the round the run stopped in and the failure that stopped it."""
+def _note_resumption(run_dir: Path, round_index: int, after: str) -> None:
+    """Add a resumption to `config.json`: when it happened, the round the run stopped in and what stopped it."""
     config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-    entry = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "round": stopped.round, "after": stopped.why_adapted}
+    entry = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "round": round_index, "after": after}
     config["resumed"] = [*config.get("resumed", []), entry]
     records.write_config(run_dir, config)
 
@@ -500,12 +593,13 @@ class Orchestrator:
         return self._play(run, state, [], 1)
 
     def resume_loop(self, flows: Sequence[Flow], examples: Sequence[Flow], spec: AdversarialSpec, run_dir: Path) -> list[RoundRecord]:
-        """Go on with a run that stopped on a failure, in its own folder, as if the failure had not happened.
+        """Go on with a run that stopped before its end, in its own folder, as if it had never stopped.
 
-        After an agent's failure, the round it stopped in was judged and told to both sides, so it is rebuilt from its rows and only its
-        adaptation is asked again, its line rewritten. After the detector stopped answering, the round was cut short and told to nobody,
-        so its rows are set aside in `interrupted.jsonl` and it is judged again from its start. Either way each agent first gets back the
-        session state it held, and the rounds left are played as `run_loop` plays them. The resumption is added to `config.json`.
+        When both sides were told of the round the run stopped in, as after an agent's failure or a process cut off while a side was
+        deciding, the round is rebuilt from its rows and only its adaptation is asked again. When they were not, as after the detector
+        stopped answering or a process cut off while the detector judged, the round's rows are set aside in `interrupted.jsonl` and it is
+        judged again from its start (`round_in_play.json`, or the round's own rows in a run that wrote none). Either way each agent first
+        gets back the session state it held, and the rounds left are played as `run_loop` plays them. The resumption goes in `config.json`.
 
         Args:
             flows: the Flows of the split, the same the run judged.
@@ -517,25 +611,58 @@ class Orchestrator:
             Every round of the run, those judged before the stop included.
 
         Raises:
-            ValueError: when the run did not stop on a failure.
+            ValueError: when the run ended in order, or was cut off before anything recorded how its round started.
         """
         history = read_resumable(run_dir)
-        stopped = history.pop()
-        _note_resumption(run_dir, stopped)
         run = _Run(flows, examples, spec, run_dir, self._run_fields(spec))
         rows = _rows_by_round(run_dir)
-        cut_short = stopped.why_adapted == DETECTOR_STOPPED
-        told = history if cut_short else [*history, stopped]
-        self.attacker.restore(_told_attacker(run_dir, told, rows, spec))
+        if failure_of(history) is None:
+            resumption = self._cut_off_resumption(
+                run, _Resumption(run_dir, history, rows, _round_start(run_dir, history, rows, spec), None)
+            )
+            _note_resumption(run_dir, resumption.start.round, CUT_OFF)
+        else:
+            stopped = history.pop()
+            _note_resumption(run_dir, stopped.round, stopped.why_adapted)
+            judged = None if stopped.why_adapted == DETECTOR_STOPPED else stopped
+            resumption = _Resumption(run_dir, history, rows, _RoundStart.of(stopped), judged)
+        return self._go_on(run, resumption)
+
+    def _cut_off_resumption(self, run: _Run, untold: _Resumption) -> _Resumption:
+        """Where a run cut off mid-round goes on from: the round's line is rebuilt from its rows when both sides were told of it."""
+        start = untold.start
+        in_play = untold.rows.get(start.round, [])
+        if not self._was_told(start, in_play, run):
+            return untold
+        state = _resumed_state(untold.run_dir, untold.history, start, untold.rows, run.spec)
+        evaluation = summarize_rows(in_play, start.note)
+        version = _Version(start.instruction_label, start.instructions_sha256)
+        outcome = _Outcome(version, evaluation, shift_between(state.previous_verdicts, evaluation.attack_verdicts))
+        judged = _judged_record(state, outcome, state_code_for(start.note, start.instruction_label, state.first_note))
+        return replace(untold, judged=judged)
+
+    def _was_told(self, start: _RoundStart, rows: Sequence[Prediction], run: _Run) -> bool:
+        """Whether both sides were told of the round in play: judged in full, and observed, as the defender's cost ledger shows."""
+        if len(rows) < len(run.flows):
+            return False
+        observed = len(self.defender.cost_history)
+        # Counting the rounds told against the ledger at the round's start, or, in a run that saved no start, the round's number.
+        return observed > start.told_before if start.told_before is not None else observed >= start.round
+
+    def _go_on(self, run: _Run, resumption: _Resumption) -> list[RoundRecord]:
+        """Go on from the round a run stopped in: ask its sides again when they were told of it, else judge it again from its start."""
+        run_dir, history, start, judged = resumption.run_dir, resumption.history, resumption.start, resumption.judged
+        told = history if judged is None else [*history, judged]
+        self.attacker.restore(_told_attacker(run_dir, told, resumption.rows, run.spec))
         self.defender.restore()
-        state = _resumed_state(run_dir, history, stopped, rows, spec)
-        if cut_short:
-            _set_aside(run_dir, stopped.round)
+        state = _resumed_state(run_dir, history, start, resumption.rows, run.spec)
+        if judged is None:
+            _set_aside(run_dir, start.round)
             _rewrite_rounds(run_dir, history)
-            return self._play(run, state, history, stopped.round)
-        history.append(self._adapt_again(run, state, stopped, rows[stopped.round]))
+            return self._play(run, state, history, start.round)
+        history.append(self._adapt_again(run, state, judged, resumption.rows[start.round]))
         _rewrite_rounds(run_dir, history)
-        return history if history[-1].who_adapts is None else self._play(run, state, history, stopped.round + 1)
+        return history if history[-1].who_adapts is None else self._play(run, state, history, start.round + 1)
 
     def _play(self, run: _Run, state: RoundState, history: list[RoundRecord], start: int) -> list[RoundRecord]:
         """Judge rounds `start` to `max_rounds` from `state`, each added to `history` and `rounds.jsonl`, until one ends the loop."""
@@ -563,6 +690,7 @@ class Orchestrator:
         # Reading the budget before the round is closed, because a new wording the attacker submits in it spends one attempt.
         attempts_left = state.remaining_attempts
         version = self._put_in_force(run.run_dir, state.instructions)
+        _save_round_in_play(run.run_dir, state, version, len(self.defender.cost_history))
         plan = RoundPlan(
             note=note,
             service_index=service_feature_index(self.config),
@@ -570,26 +698,13 @@ class Orchestrator:
             fields={**run.fields, "round": state.round_index, "instruction_label": version.label, "instructions_sha256": version.sha256},
         )
         evaluation = evaluate_round(self.detector, run.flows, run.examples, plan, partial(_append_row, run.run_dir))
-        shift = shift_between(state.previous_verdicts, evaluation.attack_verdicts)
-        code = state_code_for(note, version.label, state.first_note)
+        outcome = _Outcome(version, evaluation, shift_between(state.previous_verdicts, evaluation.attack_verdicts))
+        judged = _judged_record(state, outcome, state_code_for(note, version.label, state.first_note))
         # Closing the round before the state moves on, because the turn rule compares the note with the previous round's.
-        adaptation = self._close_round(run.spec, state, _Outcome(version, evaluation, shift))
+        adaptation = self._close_round(run.spec, state, outcome)
         state.previous_note, state.previous_verdicts = note, evaluation.attack_verdicts
         state.first_note = state.first_note or note or None
-        return RoundRecord(
-            round=state.round_index,
-            state_code=code,
-            note=note,
-            instruction_label=version.label,
-            instructions_sha256=version.sha256,
-            newly_alerted=shift.newly_alerted,
-            newly_passing=shift.newly_passing,
-            attempts_left=attempts_left,
-            f1=evaluation.f1,
-            false_alarm_rate=evaluation.false_alarm_rate,
-            **asdict(evaluation.counts),
-            **asdict(adaptation),
-        )
+        return replace(judged, attempts_left=attempts_left, **asdict(adaptation))
 
     def _put_in_force(self, run_dir: Path | None, instructions: str) -> _Version:
         """Set the detector's instructions and name them; a version's text is written once, when it first comes into force."""

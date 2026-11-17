@@ -336,7 +336,7 @@ def test_cli_resume_refuses_a_run_that_ended_in_order_and_a_model_that_fails_fir
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     _, run_dir = run_two_rounds(monkeypatch, capsys, tmp_path)
-    with pytest.raises(SystemExit, match="did not stop on a failure"):
+    with pytest.raises(SystemExit, match="ended in order"):
         cli.main(["resume", str(run_dir)])
     install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK", RuntimeError("503 overloaded")])
     with pytest.raises(SystemExit, match="agent_unavailable:defender at round 1"):
