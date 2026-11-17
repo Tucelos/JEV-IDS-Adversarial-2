@@ -1,35 +1,49 @@
-"""Keep the calls to TokenLab under its ceiling: at most 20 a minute on the key the `qwen` agent and the Clef detector share.
+"""Keep the calls to TokenLab under its ceiling and through its outages, for the key the `qwen` agent and the Clef detector share.
 
-The detectors' retries (`retry_request`) recover from a 429 after the gateway has refused a call; the spacer here keeps the refusal
-from happening. Every request to a spaced host waits until a fixed interval has passed since the previous request to that host
-started, and every client of the host shares one spacer, so the attacker's calls and the detector's calls add up under one ceiling.
-The interval is set for `QWEN_CALLS_PER_MINUTE` calls a minute, 18 unless the variable says otherwise, which leaves a margin under
-the 20 for the jitter between the moment a request leaves and the moment the gateway counts it.
+TokenLab admits at most 20 calls a minute on a key, whatever the model, and under load it answers that the model service is
+temporarily unavailable. The transport here deals with both before a response reaches the OpenAI SDK or the detector:
+
+- every request it sends, a retry included, waits until a fixed interval has passed since the previous request to the same host
+  started, and every client of the host shares one spacer, so the attacker's calls and the detector's calls add up under one
+  ceiling. The interval is set for `QWEN_CALLS_PER_MINUTE` calls a minute, 18 unless the variable says otherwise, which leaves a
+  margin under the 20 for the jitter between the moment a request leaves and the moment the gateway counts it;
+- a request the gateway refuses for a passing reason (a status in `RETRYABLE_STATUS`) or that fails in transit is sent again after
+  each of the caller's patient waits, longer when the gateway asks for it in `Retry-After`. When the waits run out, the last
+  response is given back, or the last failure raised, for the caller's own policy to read: a gateway that stays down still ends
+  the run with its error, and a permanent refusal is given back at once.
+
+The spacer lives in one process: two runs on the same key must go one after the other, never side by side.
 
 In reading order:
 
 - `CallSpacer`: the interval of one host and the moment its next request may start.
 - `calls_per_minute`: the rate to space for, from the environment, refused above the ceiling.
 - `spacer_for`: the one spacer of a host, created on first use.
-- `spacing_hooks`: the httpx event hooks under which every request of a client, retries included, waits for its host's spacer.
+- `SpacedTransport` and `spaced_transport`: the httpx transport that spaces every attempt and waits out a passing refusal.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
 
 import httpx
+
+from jev_ids.detectors import RETRYABLE_STATUS
 
 CEILING_PER_MINUTE = 20.0
 DEFAULT_CALLS_PER_MINUTE = 18.0
 # Sharing the QWEN_ prefix of the key and the endpoint the spaced clients read.
 CALLS_PER_MINUTE_VAR = "QWEN_CALLS_PER_MINUTE"
 SECONDS_PER_MINUTE = 60.0
+# Waiting up to almost four minutes in all before a refused request is given back, so a long run outlives a passing outage.
+PATIENT_WAITS: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0)
+
+logger = logging.getLogger(__name__)
 
 
 class CallSpacer:
@@ -103,14 +117,57 @@ def spacer_for(base_url: str) -> CallSpacer:
         return spacer
 
 
-def spacing_hooks(base_url: str) -> dict[str, list[Callable[..., Any]]]:
-    """The httpx event hooks under which every request of a client, a retry included, first waits for the spacer of its host.
+def retry_after(response: httpx.Response) -> float:
+    """The seconds the gateway asks a client to wait in `Retry-After`; 0 when it asks for none or not in seconds."""
+    try:
+        return max(0.0, float(response.headers.get("Retry-After", "")))
+    except ValueError:
+        return 0.0
 
-    Typed as httpx types its `EventHook`, so the mapping is accepted by `httpx.Client(event_hooks=...)` as it is.
-    """
-    spacer = spacer_for(base_url)
 
-    def wait_turn(_request: httpx.Request) -> None:
-        spacer.wait()
+class SpacedTransport(httpx.BaseTransport):
+    """Sends a request only when its host's spacer gives it a turn, and sends a passing refusal again after patient waits."""
 
-    return {"request": [wait_turn]}
+    def __init__(
+        self,
+        spacer: CallSpacer,
+        waits: Sequence[float] = PATIENT_WAITS,
+        inner: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Keep the host's spacer, the waits before each new attempt and the transport that sends; a test replaces the last two."""
+        self.spacer = spacer
+        self.waits = tuple(waits)
+        self.inner = inner if inner is not None else httpx.HTTPTransport()
+        self._sleep = sleep
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """Send `request` in its turn; a passing refusal or a failure in transit is sent again after each wait, then given back."""
+        for wait in self.waits:
+            try:
+                response = self._send(request)
+            except httpx.TransportError as exc:
+                self._pause(request, type(exc).__name__, wait)
+                continue
+            if response.status_code not in RETRYABLE_STATUS:
+                return response
+            response.close()
+            self._pause(request, f"HTTP {response.status_code}", max(wait, retry_after(response)))
+        return self._send(request)
+
+    def close(self) -> None:
+        """Close the transport that sends."""
+        self.inner.close()
+
+    def _send(self, request: httpx.Request) -> httpx.Response:
+        self.spacer.wait()
+        return self.inner.handle_request(request)
+
+    def _pause(self, request: httpx.Request, reason: str, seconds: float) -> None:
+        logger.warning("%s answered %s; sending again in %.0f s", request.url.host, reason, seconds)
+        self._sleep(seconds)
+
+
+def spaced_transport(base_url: str, waits: Sequence[float] = PATIENT_WAITS) -> SpacedTransport:
+    """A transport on the shared spacer of the host of `base_url`, with the caller's patient waits."""
+    return SpacedTransport(spacer_for(base_url), waits)

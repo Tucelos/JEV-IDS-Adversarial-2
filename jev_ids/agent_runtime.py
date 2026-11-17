@@ -4,7 +4,8 @@ In reading order:
 
 - `AgentUnavailableError`: what any failure of a participant's model becomes, so the loop records it and stops instead of crashing.
 - `OPENAI_LIKE_PROVIDERS`, `api_key_of` and `make_agent_model`: the Agno model of a participant, by provider; the requests of a
-  spaced provider wait for the spacer its host shares with every other client of it (`rate_limit.py`).
+  spaced provider wait for the spacer its host shares with every other client of it, and a passing refusal is waited out
+  (`rate_limit.py`).
 - `check_agent_model`: the one trivial question that finds a bad key before a round of detector calls is paid for.
 - `AgentBundle` and `AgentMemory`: one participant's Agno `Agent`, `LearningMachine` and `SqliteDb`.
 
@@ -32,7 +33,7 @@ from agno.run.base import RunStatus
 from pydantic import BaseModel
 
 from jev_ids.detectors import llm
-from jev_ids.rate_limit import spacing_hooks
+from jev_ids.rate_limit import spaced_transport
 
 HYDROGEN_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 QWEN_DEFAULT_BASE_URL = "https://api.tokenlab.amd.com/v1"
@@ -56,7 +57,8 @@ class OpenAIEndpoint:
         key_vars: the environment variables its key may come from, in order of preference.
         base_url_var: the variable that overrides its endpoint.
         default_base_url: the endpoint used when that variable is unset.
-        spaced: whether its gateway caps the calls a minute, so that every request waits for the spacer of its host.
+        spaced: whether its gateway caps the calls a minute and refuses calls under load, so that every request waits for the
+            spacer of its host and a passing refusal is sent again after patient waits.
     """
 
     key_vars: tuple[str, ...]
@@ -132,11 +134,12 @@ def make_agent_model(provider: str, model_id: str | None = None) -> Any:
 def _openai_like_model(provider: str, endpoint: OpenAIEndpoint, model_id: str) -> OpenAILike:
     """The Agno model of a provider reached through the OpenAI chat API.
 
-    A spaced provider gets its own httpx client, under which every request, the SDK's retries included, first waits for the
-    spacer of its host, the one its other clients share (`rate_limit.py`).
+    A spaced provider gets its own httpx client, whose transport sends every request, the SDK's retries included, only when the
+    spacer its host shares with every other client gives it a turn, and sends a passing refusal again after patient waits
+    (`rate_limit.py`). The SDK sees one answer, so the agent's session never holds a failed attempt.
     """
     base_url = os.environ.get(endpoint.base_url_var) or endpoint.default_base_url
-    http_client = httpx.Client(event_hooks=spacing_hooks(base_url), timeout=AGENT_TIMEOUT) if endpoint.spaced else None
+    http_client = httpx.Client(transport=spaced_transport(base_url), timeout=AGENT_TIMEOUT) if endpoint.spaced else None
     return OpenAILike(id=model_id, api_key=api_key_of(provider), base_url=base_url, temperature=0.0, http_client=http_client)
 
 

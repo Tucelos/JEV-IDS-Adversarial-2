@@ -1,15 +1,16 @@
 """Builders shared by the test modules: a card, two prompt files, Flows, rows, files."""
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 
-from jev_ids import rate_limit
 from jev_ids.dataset import Config, Flow, split_header, write_split
-from jev_ids.rate_limit import CallSpacer
+from jev_ids.rate_limit import PATIENT_WAITS, CallSpacer, SpacedTransport
 from jev_ids.records import Prediction
 
 # Defining a three-feature card with one symbolic feature and three Categories.
@@ -176,9 +177,24 @@ class FakeClock:
         self.now += seconds
 
 
-def fake_tokenlab_spacer(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
-    """Give the test a spacer registry of its own whose TokenLab spacer, at 20 calls a minute, runs on the fake clock returned."""
-    clock = FakeClock()
-    spacers = {"api.tokenlab.amd.com": CallSpacer(20, clock=clock.time, sleep=clock.sleep)}
-    monkeypatch.setattr(rate_limit, "_SPACERS", spacers)
-    return clock
+Gateway = Callable[[httpx.Request], httpx.Response]
+
+
+def fake_transport(gateway: Gateway, clock: FakeClock, waits: Sequence[float] = ()) -> SpacedTransport:
+    """A TokenLab transport over `gateway`, spaced at 20 calls a minute on `clock`, with `waits` before each new attempt."""
+    spacer = CallSpacer(20, clock=clock.time, sleep=clock.sleep)
+    return SpacedTransport(spacer, waits, inner=httpx.MockTransport(gateway), sleep=clock.sleep)
+
+
+def fake_spaced_transport(
+    monkeypatch: pytest.MonkeyPatch, module: ModuleType, gateway: Gateway, clock: FakeClock
+) -> list[tuple[str, tuple[float, ...]]]:
+    """Make `module` build its TokenLab transport over `gateway` on `clock`, and return the base URL and waits of each it built."""
+    built: list[tuple[str, tuple[float, ...]]] = []
+
+    def build(base_url: str, waits: Sequence[float] = PATIENT_WAITS) -> SpacedTransport:
+        built.append((base_url, tuple(waits)))
+        return fake_transport(gateway, clock, waits)
+
+    monkeypatch.setattr(module, "spaced_transport", build)
+    return built

@@ -17,12 +17,13 @@ from jev_ids.detectors import DecisionDetector, normalize_decision_usage, system
 from jev_ids.detectors.systemone import (
     DEFAULT_MODEL,
     ENDPOINT,
+    PATIENCE,
     SystemOneDetector,
     attempt,
     request_body,
 )
 from jev_ids.run import RunSpec, build_detector, sample_examples
-from tests.helpers import CATEGORIES, CONFIG, FLOW, JEV_PROMPT, TOKENLAB, TRAIN, fake_tokenlab_spacer, no_sleep
+from tests.helpers import CATEGORIES, CONFIG, FLOW, JEV_PROMPT, TOKENLAB, TRAIN, FakeClock, fake_spaced_transport, no_sleep
 
 Reply = tuple[int, dict[str, Any]] | Exception
 
@@ -167,19 +168,15 @@ def test_build_detector_selects_system_one() -> None:
     assert detector.model == DEFAULT_MODEL
 
 
-def no_post(_client: Any, _model: str, _body: dict[str, Any]) -> dict[str, Any]:
-    """A `post` that sends nothing, so the client the detector builds for itself can be read without the network."""
-    return {"p_attack": 0.5}
-
-
-def test_the_detector_waits_for_the_spacer_it_shares_with_the_qwen_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_detector_rides_out_a_refusal_through_the_spaced_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QWEN_API_KEY", "test-key")
     monkeypatch.delenv("QWEN_BASE_URL", raising=False)
-    clock = fake_tokenlab_spacer(monkeypatch)
-    monkeypatch.setattr(systemone, "post", no_post)
-    detector = SystemOneDetector(JEV_PROMPT)
-    detector.predict(FLOW, [])
-    (hook,) = detector.client.event_hooks["request"]
-    for _ in range(2):
-        hook(httpx.Request("POST", f"{TOKENLAB}{ENDPOINT}"))
-    assert clock.slept == [3.0]
+    clock = FakeClock()
+    gateway = FakeGateway([errored(503), answered(0.7)])
+    built = fake_spaced_transport(monkeypatch, systemone, gateway.handle, clock)
+    out = SystemOneDetector(JEV_PROMPT).predict(FLOW, [])
+    # The transport waited out the 503, so `post` saw one answer and counts no retry of its own.
+    assert (out["p_attack"], out["retries"]) == (0.7, 0)
+    assert built == [(TOKENLAB, PATIENCE)]
+    assert clock.slept == [15.0]
+    assert len(gateway.requests) == 2

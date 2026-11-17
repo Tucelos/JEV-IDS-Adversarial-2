@@ -1,6 +1,7 @@
 """The Agno runtime of a participant: the model of a provider, the question before round 1, failures and the SQLite memory."""
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,7 @@ from agno.models.anthropic import Claude
 from agno.models.openai.like import OpenAILike
 from agno.run.base import RunStatus
 
+from jev_ids import agent_runtime
 from jev_ids.agent_runtime import (
     AGENT_TIMEOUT,
     HYDROGEN_KEY_VARS,
@@ -24,8 +26,9 @@ from jev_ids.agent_runtime import (
     make_agent_model,
 )
 from jev_ids.agents import AttackerDecision, RetiredNote
+from jev_ids.rate_limit import PATIENT_WAITS
 from tests.adversarial_helpers import ScriptedAgnoModel, attacker_says
-from tests.helpers import fake_tokenlab_spacer
+from tests.helpers import FakeClock, fake_spaced_transport
 
 
 def open_memory(memory_dir: Path, model: ScriptedAgnoModel) -> AgentMemory:
@@ -187,32 +190,42 @@ def test_ledger_records_outlive_the_process_only_through_the_memory_folder(tmp_p
     elsewhere.close()
 
 
-def chat_answer(request: httpx.Request) -> httpx.Response:
-    """A 200 chat completion of an OpenAI-compatible gateway, whatever was asked: the attacker keeps its note."""
-    completion = {
-        "id": "chatcmpl-1",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "Qwen3.8-27B",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": attacker_says("keep")}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-    }
-    return httpx.Response(200, json=completion, request=request)
+def chat_gateway(*statuses: int) -> Callable[[httpx.Request], httpx.Response]:
+    """An OpenAI-compatible gateway giving each request the next status; a 200 carries a completion in which the attacker keeps."""
+    queue = list(statuses)
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        status = queue.pop(0)
+        if status != 200:
+            return httpx.Response(status, json={"error": {"message": "The model service is temporarily unavailable."}}, request=request)
+        completion = {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "Qwen3.8-27B",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": attacker_says("keep")}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        return httpx.Response(200, json=completion, request=request)
+
+    return answer
 
 
-def test_the_qwen_agent_waits_for_the_tokenlab_spacer_on_every_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Running the real OpenAI client over a mock transport, under the hooks `make_agent_model` installed, so the spacing tested
-    # is the one a run gets.
+def test_the_qwen_agent_rides_out_a_refusal_through_the_spaced_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Running the real OpenAI client over the transport `make_agent_model` asks for, so the spacing and the patience tested are
+    # the ones a run gets; the SDK never sees the 503 the transport waited out.
     monkeypatch.setenv("QWEN_API_KEY", "test-q-key")
     monkeypatch.delenv("QWEN_BASE_URL", raising=False)
-    clock = fake_tokenlab_spacer(monkeypatch)
+    clock = FakeClock()
+    built = fake_spaced_transport(monkeypatch, agent_runtime, chat_gateway(503, 200, 200), clock)
     model = make_agent_model("qwen")
     assert isinstance(model.http_client, httpx.Client)
     assert model.http_client.timeout == AGENT_TIMEOUT
-    model.http_client = httpx.Client(transport=httpx.MockTransport(chat_answer), event_hooks=model.http_client.event_hooks)
     check_agent_model(model, "attacker", AttackerDecision)
     check_agent_model(model, "attacker", AttackerDecision)
-    assert clock.slept == [3.0]
+    assert built == [(QWEN_DEFAULT_BASE_URL, PATIENT_WAITS)]
+    # 15 s waited out the 503; the second question then waits the rest of its 3 s interval.
+    assert clock.slept == [15.0, 3.0]
     # The hydrogen agent's gateway sets no such ceiling, so its requests go through the SDK's own client, unspaced.
     monkeypatch.setenv("HYDROGEN_API_KEY", "test-h-key")
     assert make_agent_model("hydrogen").http_client is None

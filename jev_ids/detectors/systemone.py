@@ -10,7 +10,8 @@ The request body (`state`, `questions`) and the answer shape (`answers`, `usage`
 `gemini_decision`, so `build_decision_body` and `decision_measurements` of the package build and read them here too.
 
 TokenLab admits at most 20 calls a minute on a key, and this detector shares its key with the `qwen` agent: every request,
-a retry included, first waits for the spacer of the gateway's host (`rate_limit.py`), so the two add up under one ceiling.
+a retry included, goes out through the transport of `rate_limit.py`, which waits for the spacer of the gateway's host, so the
+two add up under one ceiling, and sends a passing refusal again after short patient waits, before `post` retries on its own.
 """
 
 import os
@@ -31,7 +32,7 @@ from jev_ids.detectors import (
     decision_measurements,
     retry_request,
 )
-from jev_ids.rate_limit import spacing_hooks
+from jev_ids.rate_limit import spaced_transport
 
 API_KEY_VAR = "QWEN_API_KEY"
 BASE_URL_VAR = "QWEN_BASE_URL"
@@ -39,6 +40,9 @@ DEFAULT_BASE_URL = "https://api.tokenlab.amd.com/v1"
 DEFAULT_MODEL = "Clef"
 ENDPOINT = "/systemone"
 HTTP_OK = 200
+# Waiting out a passing refusal for up to 45 s before `post` retries, shorter than an agent's patience because every refused
+# attempt is retried again by `post`, and a round of 50 records stops after 10 failed calls in a row.
+PATIENCE: tuple[float, ...] = (15.0, 30.0)
 
 
 class SystemOneDetector(DecisionTemplate):
@@ -58,7 +62,7 @@ class SystemOneDetector(DecisionTemplate):
             base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             timeout=TIMEOUT_SECONDS,
-            event_hooks=spacing_hooks(base_url),
+            transport=spaced_transport(base_url, PATIENCE),
         )
         return self.client
 
