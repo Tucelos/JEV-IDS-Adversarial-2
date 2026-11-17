@@ -8,6 +8,9 @@ key, so the adversarial defender can rewrite `state.instructions` between rounds
 
 The request body (`state`, `questions`) and the answer shape (`answers`, `usage`) are the decision protocol shared with
 `gemini_decision`, so `build_decision_body` and `decision_measurements` of the package build and read them here too.
+
+TokenLab admits at most 20 calls a minute on a key, and this detector shares its key with the `qwen` agent: every request,
+a retry included, first waits for the spacer of the gateway's host (`rate_limit.py`), so the two add up under one ceiling.
 """
 
 import os
@@ -28,6 +31,7 @@ from jev_ids.detectors import (
     decision_measurements,
     retry_request,
 )
+from jev_ids.rate_limit import spacing_hooks
 
 API_KEY_VAR = "QWEN_API_KEY"
 BASE_URL_VAR = "QWEN_BASE_URL"
@@ -54,6 +58,7 @@ class SystemOneDetector(DecisionTemplate):
             base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             timeout=TIMEOUT_SECONDS,
+            event_hooks=spacing_hooks(base_url),
         )
         return self.client
 

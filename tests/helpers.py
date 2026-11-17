@@ -5,7 +5,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from jev_ids import rate_limit
 from jev_ids.dataset import Config, Flow, split_header, write_split
+from jev_ids.rate_limit import CallSpacer
 from jev_ids.records import Prediction
 
 # Defining a three-feature card with one symbolic feature and three Categories.
@@ -152,3 +156,29 @@ class FakeResponse:
 def no_sleep(_seconds: float) -> None:
     """A backoff that does not wait, for the retry tests."""
     return None
+
+
+TOKENLAB = "https://api.tokenlab.amd.com/v1"
+
+
+class FakeClock:
+    """A clock that moves only when the code under test sleeps, or when a test moves it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.slept: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def fake_tokenlab_spacer(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Give the test a spacer registry of its own whose TokenLab spacer, at 20 calls a minute, runs on the fake clock returned."""
+    clock = FakeClock()
+    spacers = {"api.tokenlab.amd.com": CallSpacer(20, clock=clock.time, sleep=clock.sleep)}
+    monkeypatch.setattr(rate_limit, "_SPACERS", spacers)
+    return clock

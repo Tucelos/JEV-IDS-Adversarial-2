@@ -132,9 +132,10 @@ Crie um arquivo `.env` na raiz do repositório. O git o ignora, e o comando o l�
 
 ```env
 GEMINI_API_KEY=...
+QWEN_API_KEY=...
 ```
 
-Essa única chave atende o detector `gemini_decision` e os agentes `hydrogen`. `ANTHROPIC_API_KEY` só é necessária com `--attacker claude` ou `--defender claude`. O agente `hydrogen` usa a primeira variável definida entre `HYDROGEN_API_KEY`, `GEMINI_API_KEY` e `GOOGLE_API_KEY`; `HYDROGEN_BASE_URL` é opcional. As credenciais dos outros detectores estão em [README.jev-ids.md](README.jev-ids.md).
+`GEMINI_API_KEY` atende o detector `gemini_decision` e os agentes `hydrogen`; `QWEN_API_KEY` (TokenLab) atende o agente `qwen` e o detector `systemone` (Clef), e `QWEN_BASE_URL` é opcional. O TokenLab admite no máximo 20 chamadas por minuto nessa chave, então todo pedido do agente `qwen` e do detector `systemone`, retentativas incluídas, espera um espaçador compartilhado (`jev_ids/rate_limit.py`) que mantém os dois juntos abaixo do teto: 18 por minuto por padrão, com folga; `QWEN_CALLS_PER_MINUTE` muda esse ritmo e é recusada acima de 20. `ANTHROPIC_API_KEY` só é necessária com `--attacker claude` ou `--defender claude`. O agente `hydrogen` usa a primeira variável definida entre `HYDROGEN_API_KEY`, `GEMINI_API_KEY` e `GOOGLE_API_KEY`; `HYDROGEN_BASE_URL` é opcional. As credenciais dos outros detectores estão em [README.jev-ids.md](README.jev-ids.md).
 
 Comando recomendado, em Bash:
 
@@ -143,7 +144,7 @@ uv run jev-ids adversarial \
   --dataset data/nsl-kdd/dataset.json \
   --split internal \
   --detector gemini_decision \
-  --attacker hydrogen \
+  --attacker qwen \
   --defender hydrogen \
   --rounds 5 \
   --max-attempts 3 \
@@ -159,7 +160,7 @@ uv run jev-ids adversarial `
   --dataset data/nsl-kdd/dataset.json `
   --split internal `
   --detector gemini_decision `
-  --attacker hydrogen `
+  --attacker qwen `
   --defender hydrogen `
   --rounds 5 `
   --max-attempts 3 `
@@ -168,13 +169,13 @@ uv run jev-ids adversarial `
   --k 0
 ```
 
-`--attacker hydrogen` precisa ser explícito, porque o padrão do atacante é `claude`. O split `internal` tem 50 registros, 31 de ataque (18 `dos`, 8 `probe`, 4 `r2l`, 1 `u2r`) e 19 normais, e cada rodada faz 50 chamadas ao detector. O split `smoke` tem 5 registros e um único ataque, e por isso serve apenas para conferir chaves e conexão: cada rodada dá ao atacante um único veredito. O split `pilot` tem 300 registros (160 de ataque e 140 normais).
+`--attacker qwen` precisa ser explícito, porque o padrão do atacante é `claude`, e tanto Claude quanto Gemini (o que inclui `hydrogen`) recusam o papel de atacante (seção 6). O split `internal` tem 50 registros, 31 de ataque (18 `dos`, 8 `probe`, 4 `r2l`, 1 `u2r`) e 19 normais, e cada rodada faz 50 chamadas ao detector. O split `smoke` tem 5 registros e um único ataque, e por isso serve apenas para conferir chaves e conexão: cada rodada dá ao atacante um único veredito. O split `pilot` tem 300 registros (160 de ataque e 140 normais).
 
 | Opção | Padrão | Efeito |
 |---|---|---|
 | `--dataset` | obrigatória | ficha do dataset, `data/nsl-kdd/dataset.json` |
 | `--split` | `smoke` | split julgado em toda rodada, em `data/nsl-kdd/splits/` |
-| `--detector` | obrigatória | `gemini_decision`, `jev`, `llm:deepseek`, `llm:openai` ou `llm:gemini` |
+| `--detector` | obrigatória | `gemini_decision`, `systemone`, `jev`, `llm:deepseek`, `llm:openai` ou `llm:gemini` |
 | `--detector-model` | o do detector | outro modelo para o detector |
 | `--attacker`, `--defender` | `claude`, `hydrogen` | provedor do modelo de cada agente |
 | `--attacker-model`, `--defender-model` | o do provedor | outro modelo para o agente |

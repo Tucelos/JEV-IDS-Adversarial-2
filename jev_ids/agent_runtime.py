@@ -3,7 +3,8 @@
 In reading order:
 
 - `AgentUnavailableError`: what any failure of a participant's model becomes, so the loop records it and stops instead of crashing.
-- `OPENAI_LIKE_PROVIDERS`, `api_key_of` and `make_agent_model`: the Agno model of a participant, by provider.
+- `OPENAI_LIKE_PROVIDERS`, `api_key_of` and `make_agent_model`: the Agno model of a participant, by provider; the requests of a
+  spaced provider wait for the spacer its host shares with every other client of it (`rate_limit.py`).
 - `check_agent_model`: the one trivial question that finds a bad key before a round of detector calls is paid for.
 - `AgentBundle` and `AgentMemory`: one participant's Agno `Agent`, `LearningMachine` and `SqliteDb`.
 
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
 from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 from agno.learn import DecisionLogConfig, LearningMachine, LearningMode, UserMemoryConfig
@@ -30,6 +32,7 @@ from agno.run.base import RunStatus
 from pydantic import BaseModel
 
 from jev_ids.detectors import llm
+from jev_ids.rate_limit import spacing_hooks
 
 HYDROGEN_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 QWEN_DEFAULT_BASE_URL = "https://api.tokenlab.amd.com/v1"
@@ -53,20 +56,25 @@ class OpenAIEndpoint:
         key_vars: the environment variables its key may come from, in order of preference.
         base_url_var: the variable that overrides its endpoint.
         default_base_url: the endpoint used when that variable is unset.
+        spaced: whether its gateway caps the calls a minute, so that every request waits for the spacer of its host.
     """
 
     key_vars: tuple[str, ...]
     base_url_var: str
     default_base_url: str
+    spaced: bool = False
 
 
 OPENAI_LIKE_PROVIDERS: dict[str, OpenAIEndpoint] = {
     "hydrogen": OpenAIEndpoint(HYDROGEN_KEY_VARS, "HYDROGEN_BASE_URL", HYDROGEN_DEFAULT_BASE_URL),
-    "qwen": OpenAIEndpoint(QWEN_KEY_VARS, "QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL),
+    "qwen": OpenAIEndpoint(QWEN_KEY_VARS, "QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL, spaced=True),
 }
 PROBE_QUESTION = "Connectivity check before the study starts: no data is under review yet. Answer with the action `keep`."
 # Cutting an error text to this length before it reaches a record, a log line or the terminal.
 DETAIL_LENGTH = 300
+# The OpenAI SDK's own defaults, ten minutes for an answer and five seconds to connect, set on a spaced client explicitly,
+# because the SDK keeps the timeout of a client it is handed unless that timeout equals httpx's default.
+AGENT_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
 
 
 class AgentUnavailableError(RuntimeError):
@@ -117,9 +125,19 @@ def make_agent_model(provider: str, model_id: str | None = None) -> Any:
         return Claude(id=resolved)
     endpoint = OPENAI_LIKE_PROVIDERS.get(normalized)
     if endpoint is not None:
-        base_url = os.environ.get(endpoint.base_url_var) or endpoint.default_base_url
-        return OpenAILike(id=resolved, api_key=api_key_of(normalized), base_url=base_url, temperature=0.0)
+        return _openai_like_model(normalized, endpoint, resolved)
     return llm.make_model(normalized, resolved)
+
+
+def _openai_like_model(provider: str, endpoint: OpenAIEndpoint, model_id: str) -> OpenAILike:
+    """The Agno model of a provider reached through the OpenAI chat API.
+
+    A spaced provider gets its own httpx client, under which every request, the SDK's retries included, first waits for the
+    spacer of its host, the one its other clients share (`rate_limit.py`).
+    """
+    base_url = os.environ.get(endpoint.base_url_var) or endpoint.default_base_url
+    http_client = httpx.Client(event_hooks=spacing_hooks(base_url), timeout=AGENT_TIMEOUT) if endpoint.spaced else None
+    return OpenAILike(id=model_id, api_key=api_key_of(provider), base_url=base_url, temperature=0.0, http_client=http_client)
 
 
 def _run_checked(agent: Any, role: str, prompt: str, **run_options: Any) -> Any:
