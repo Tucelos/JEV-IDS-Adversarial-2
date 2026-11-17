@@ -227,9 +227,13 @@ Pasta: `adv_nsl-kdd_gemini_decision_2026-11-16_194810`.
 
 A leitura responde à pergunta central. Na rodada 1, a nota no campo `service` fez o detector não alertar em nenhum ataque (detecção 0). O defensor reagiu reforçando as instruções (`R`), e a detecção subiu para 15. Na rodada 2, o atacante viu seus registros serem pegos (`newly_alerted` alto) e retirou a nota; na 3, reformulou para uma redação de outro tipo. Na 4, o defensor voltou a perder registros e escreveu uma revisão própria (`V3`). Cada decisão de um lado muda o que o outro observa e faz na rodada seguinte: é o laço adaptativo, não uma sequência roteirizada.
 
-### 6.2 Comparação de dois modelos de decisão
+![O laço rodada a rodada: taxa de detecção e de falso alarme nas cinco rodadas; a faixa inferior mostra qual lado o orquestrador escolheu para adaptar após cada rodada, verde defensor e vermelho atacante](results/comparison/laco_rodada_a_rodada.png)
 
-Mesma configuração (atacante Qwen, defensor Hydrogen, split `internal`, 5 rodadas, `--k 0`), trocando só o detector: `gemini_decision` (`gemini-decision-1`) contra `systemone` (`Clef`, no endpoint TokenLab). Pasta do Clef: `adv_nsl-kdd_systemone_2026-11-16_201829`.
+A figura resume o laço inteiro num gráfico, gerado pelo mesmo script da seção 6.2. A detecção (linha azul) parte de zero sob a nota inicial, sobe quando o defensor reforça as instruções, recua na rodada 4 quando a nota reformulada do atacante (`N'`) volta a evadir, e o falso alarme (linha tracejada) fica baixo com o Gemini Decision. A faixa inferior marca a alternância que o orquestrador decide — defensor, atacante, atacante, defensor — ou seja, o aprimoramento do contexto de defesa e a melhoria dos ataques acontecendo em turnos.
+
+### 6.2 Bônus: comparação de dois modelos de decisão
+
+Isto é um extra ao laço com um só detector (seção 6.1): repetimos a mesma execução trocando apenas o modelo de decisão, para ver qual resiste melhor. Mesma configuração (atacante Qwen, defensor Hydrogen, split `internal`, 5 rodadas, `--k 0`), trocando só o detector: `gemini_decision` (`gemini-decision-1`) contra `systemone` (`Clef`, no endpoint TokenLab). Pasta do Clef: `adv_nsl-kdd_systemone_2026-11-16_201829`.
 
 | Rodada | Estado | Detecção — Gemini | Detecção — Clef | Falso alarme — Gemini | Falso alarme — Clef |
 |---|---|---|---|---|---|
@@ -274,7 +278,7 @@ O trade-off deixa a diferença visível: o Gemini Decision fica à esquerda (fal
 
 ## 8. Testes offline e dashboard
 
-Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py` e `tests/test_gemini_decision.py`) rodam sem rede e sem chaves. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
+Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py`, `tests/test_gemini_decision.py` e `tests/test_systemone.py`) rodam sem rede e sem chaves, e todos passam. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
 
 Os testes provam a mecânica do laço: a regra de turno, os vetos, o orçamento, os rótulos das versões, o que cada lado pode ver, os arquivos gravados e o tratamento de falhas. Não provam como modelos e detectores reais se comportam. A trajetória `N/B → N/R → S/R → S/B → N'/B` do teste canônico, em `tests/test_adversarial.py`, sai do roteiro, e os números dos testes não são resultados.
 

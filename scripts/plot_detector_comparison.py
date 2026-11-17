@@ -4,9 +4,12 @@ Run from the repository root. matplotlib is not a project dependency (the benchm
 
     uv run --with matplotlib python -m scripts.plot_detector_comparison
 
-It writes two PNGs next to the CSV, both comparing Gemini Decision and Clef across the five rounds of one run each:
+It writes three PNGs next to the CSV:
 
-- `metricas_por_rodada.png`: detection rate, false-alarm rate and F1, one panel each, one line per detector.
+- `laco_rodada_a_rodada.png`: the adversarial loop itself, one run (Gemini Decision) read round by round — detection and
+  false alarm across the rounds, with the side the orchestrator chose to adapt after each round shown underneath.
+- `metricas_por_rodada.png`: detection rate, false-alarm rate and F1, one panel each, one line per detector (the two-detector
+  comparison, a bonus over the single-detector loop).
 - `tradeoff_deteccao_falso_alarme.png`: detection against false alarm, the trajectory of each detector over the rounds, so the
   reader sees that Clef buys detection with a high false-alarm rate while Gemini Decision stays balanced.
 
@@ -21,6 +24,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (the Agg backend must be chosen before pyplot is imported)
+from matplotlib.patches import Rectangle  # noqa: E402  (same reason: imported after the backend is set)
 
 COMPARISON_DIR = Path("results/comparison")
 CSV_PATH = COMPARISON_DIR / "detector_comparison.csv"
@@ -35,6 +39,11 @@ PANELS: tuple[tuple[str, str], ...] = (
     ("false_alarm_rate", "Taxa de falso alarme"),
     ("f1", "F1"),
 )
+# The run section 6.1 reads round by round: the core loop with a single detector.
+LOOP_DETECTOR = "gemini_decision/gemini-decision-1"
+# Who the orchestrator chose to adapt after a round, in the colours the loop diagrams use: green defender, red attacker, grey end.
+WHO_COLORS: dict[str, str] = {"defender": "#2ca02c", "attacker": "#d62728", "": "#9e9e9e"}
+WHO_LABELS: dict[str, str] = {"defender": "defensor", "attacker": "atacante", "": "fim"}
 
 
 def load_rows(csv_path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -113,13 +122,52 @@ def plot_tradeoff(data: dict[str, list[dict[str, Any]]], out_path: Path) -> None
     plt.close(figure)
 
 
+def draw_adaptation_strip(axis: Any, rows: list[dict[str, Any]]) -> None:
+    """A coloured cell per round naming the side the orchestrator chose to adapt after that round."""
+    for row in rows:
+        position = int(row["round"])
+        who = row["who_adapts"]
+        axis.add_patch(Rectangle((position - 0.45, 0.0), 0.9, 1.0, color=WHO_COLORS.get(who, "#9e9e9e")))
+        axis.text(position, 0.5, WHO_LABELS.get(who, who), ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+    axis.set_ylim(0.0, 1.0)
+    axis.set_yticks([])
+    axis.set_ylabel("quem\nadapta", rotation=0, ha="right", va="center", fontsize=8)
+
+
+def plot_loop_round_by_round(rows: list[dict[str, Any]], out_path: Path) -> None:
+    """One run read round by round: detection and false alarm across the rounds, who adapts shown under each round."""
+    figure, (top, strip) = plt.subplots(2, 1, figsize=(9.5, 6.0), height_ratios=[6, 1], sharex=True)
+    xs = [int(row["round"]) for row in rows]
+    top.plot(xs, [float(row["detection_rate"]) for row in rows], marker="o", color="#0072B2", linewidth=2.2,
+             label="Taxa de detecção (ataques capturados)")
+    top.plot(xs, [float(row["false_alarm_rate"]) for row in rows], marker="s", linestyle="--", color="#555555", linewidth=1.8,
+             label="Taxa de falso alarme (usuário legítimo)")
+    top.set_xlim(0.5, len(rows) + 0.5)
+    top.set_ylim(-0.05, 1.05)
+    top.set_ylabel("proporção")
+    top.grid(visible=True, alpha=0.3)
+    top.legend(loc="upper left", fontsize=9)
+    top.set_title("O laço adversarial rodada a rodada — detector Gemini Decision", fontsize=12)
+    draw_adaptation_strip(strip, rows)
+    positions, labels = round_ticks(rows)
+    strip.set_xticks(positions)
+    strip.set_xticklabels(labels, fontsize=9)
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+
+
 def main() -> None:
-    """Read the comparison CSV and write both figures next to it."""
+    """Read the comparison CSV and write the loop figure and the two comparison figures next to it."""
     data = load_rows(CSV_PATH)
-    plot_metrics_per_round(data, COMPARISON_DIR / "metricas_por_rodada.png")
-    plot_tradeoff(data, COMPARISON_DIR / "tradeoff_deteccao_falso_alarme.png")
-    print(f"wrote {COMPARISON_DIR / 'metricas_por_rodada.png'}")
-    print(f"wrote {COMPARISON_DIR / 'tradeoff_deteccao_falso_alarme.png'}")
+    loop_path = COMPARISON_DIR / "laco_rodada_a_rodada.png"
+    metrics_path = COMPARISON_DIR / "metricas_por_rodada.png"
+    tradeoff_path = COMPARISON_DIR / "tradeoff_deteccao_falso_alarme.png"
+    plot_loop_round_by_round(data[LOOP_DETECTOR], loop_path)
+    plot_metrics_per_round(data, metrics_path)
+    plot_tradeoff(data, tradeoff_path)
+    for path in (loop_path, metrics_path, tradeoff_path):
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":
