@@ -7,9 +7,9 @@ In reading order:
 - `RoundState`, `Adaptation` and `RoundRecord`: what a round starts from, how it ended, and the line it leaves in `rounds.jsonl`.
 - `state_code_for`: the compact code of a round (`N/B`, `N/R`, `S/R`, `S/B`, `N'/B`).
 - `relative_memory_dir`: the agents' memory folder as `config.json` records it, relative to the run directory.
-- `read_rounds` and `read_resumable`: the rounds a run recorded, and those of a run that stopped on a failure.
+- `read_rounds` and `read_resumable`: the rounds a run recorded, and those of a run that stopped before its end.
 - `Orchestrator`: the loop `action -> detector verdict -> observation -> adaptation`, with no model of its own, and the resumption
-  of a run that stopped on a failure (`Orchestrator.resume_loop`).
+  of a run that stopped before its end, or past the round both sides held in (`Orchestrator.resume_loop`).
 - `failure_of`: the reason a run ended on a failure, which the CLI turns into its exit code.
 - `check_detector_name`, `run_adversarial`, `spec_of` and `resume_adversarial`: the CLI entries that string the above together, to
   start a run or to go on with one that stopped.
@@ -19,7 +19,8 @@ The attacker (`agents.AttackerAgent`) may only change the note appended to the `
 change the detector's instruction text, and sees aggregate counts plus the notes that were tested. Everything else stays fixed: the other
 attributes, the Examples, the detector and the cut at `p_attack >= 0.5`. After each round the turn rule (`turns.decide_who_adapts`) names
 the side that adapts. When that side returns the action already in force, the other side is asked once, and when it holds too the loop
-stops as `stable`.
+stops as `stable`. A resumption may go on past that round (`past_stable`), as after an agent's prompt was corrected: the next round
+starts from the same note and instructions, and the loop stops again at the next round both sides hold in.
 
 A run writes `config.json`, one row per call in `predictions.jsonl` (appended right after the call), one line per round in `rounds.jsonl`,
 the text of every instruction version that was in force as `instructions/<label>.txt`, and the agents' memories, under `memory/` by default.
@@ -367,16 +368,32 @@ def read_rounds(run_dir: Path) -> list[RoundRecord]:
     return [RoundRecord(**json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def read_resumable(run_dir: Path) -> list[RoundRecord]:
+def read_resumable(run_dir: Path, past_stable: bool = False) -> list[RoundRecord]:
     """The rounds of a run that stopped before its end: on a failure, the stopped round last, or cut off in the middle of a round.
 
+    With `past_stable`, a run whose last round both sides held in has not ended either: it goes on past that round. Neither has a run
+    resumed past that round already, which a process going down cut off before the next round wrote its line.
+
     Raises:
-        ValueError: when the run ended in order, on its last round or with both sides holding.
+        ValueError: when the run ended in order: on its last round, or with both sides holding and not going on past that round.
     """
     history = read_rounds(run_dir)
-    if history and failure_of(history) is None and history[-1].who_adapts is None:
-        raise ValueError(f"{run_dir.name} ended in order ({history[-1].why_adapted}), so there is nothing to resume")
+    if history and failure_of(history) is None and history[-1].who_adapts is None and not _goes_past(run_dir, history[-1], past_stable):
+        why = history[-1].why_adapted
+        hint = "; `--past-stable` goes on past a round both sides held in" if why == STABLE else ""
+        raise ValueError(f"{run_dir.name} ended in order ({why}), so there is nothing to resume{hint}")
     return history
+
+
+def _goes_past(run_dir: Path, last: RoundRecord, past_stable: bool) -> bool:
+    """Whether a run goes on past its `last` round: both sides held in it, and it is resumed past it, now or before."""
+    return last.why_adapted == STABLE and (past_stable or _resumed_past(run_dir, last.round))
+
+
+def _resumed_past(run_dir: Path, round_index: int) -> bool:
+    """Whether `config.json` records a resumption past `round_index`, a round both sides held in."""
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    return any(entry["round"] == round_index and entry["after"] == STABLE for entry in config.get("resumed", []))
 
 
 @dataclass(frozen=True)
@@ -430,8 +447,7 @@ def _round_start(run_dir: Path, history: Sequence[RoundRecord], rows: dict[int, 
         ValueError: when neither tells, as when the process stopped before the round wrote its first attack row.
     """
     in_play = history[-1].round + 1 if history else 1
-    path = run_dir / ROUND_IN_PLAY
-    saved = _RoundStart(**json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
+    saved = _saved_start(run_dir)
     if saved is not None and saved.round == in_play:
         return saved
     attack = next((row for row in rows.get(in_play, []) if row["is_attack"]), None)
@@ -443,6 +459,19 @@ def _round_start(run_dir: Path, history: Sequence[RoundRecord], rows: dict[int, 
     # A new wording put in force after the previous round spent one attempt, as `_attacker_move` counts it.
     spent = int(bool(note) and note != history[-1].note)
     return _RoundStart(in_play, note, attack["instruction_label"], attack["instructions_sha256"], history[-1].attempts_left - spent)
+
+
+def _saved_start(run_dir: Path) -> _RoundStart | None:
+    """The start of the round in play as `round_in_play.json` saved it; None in a run that saved none."""
+    path = run_dir / ROUND_IN_PLAY
+    return _RoundStart(**json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
+
+
+def _next_round_left_nothing(run_dir: Path, history: Sequence[RoundRecord], rows: dict[int, list[Prediction]]) -> bool:
+    """Whether the round after the last one recorded left nothing behind: no start saved for it and no row of it."""
+    following = history[-1].round + 1
+    saved = _saved_start(run_dir)
+    return not rows.get(following) and (saved is None or saved.round != following)
 
 
 def _rewrite_rounds(run_dir: Path, history: Sequence[RoundRecord]) -> None:
@@ -545,6 +574,12 @@ def _note_resumption(run_dir: Path, round_index: int, after: str) -> None:
     records.write_config(run_dir, config)
 
 
+def _move_on(state: RoundState, note: str, verdicts: dict[int, bool]) -> None:
+    """Carry a closed round's note and attack verdicts into `state`, which the next round's turn rule compares with."""
+    state.previous_note, state.previous_verdicts = note, verdicts
+    state.first_note = state.first_note or note or None
+
+
 class Orchestrator:
     """Non-LLM closed-loop coordinator connecting detector, evaluator, attacker, and defender."""
 
@@ -592,20 +627,25 @@ class Orchestrator:
         )
         return self._play(run, state, [], 1)
 
-    def resume_loop(self, flows: Sequence[Flow], examples: Sequence[Flow], spec: AdversarialSpec, run_dir: Path) -> list[RoundRecord]:
+    def resume_loop(
+        self, flows: Sequence[Flow], examples: Sequence[Flow], spec: AdversarialSpec, run_dir: Path, past_stable: bool = False
+    ) -> list[RoundRecord]:
         """Go on with a run that stopped before its end, in its own folder, as if it had never stopped.
 
         When both sides were told of the round the run stopped in, as after an agent's failure or a process cut off while a side was
         deciding, the round is rebuilt from its rows and only its adaptation is asked again. When they were not, as after the detector
         stopped answering or a process cut off while the detector judged, the round's rows are set aside in `interrupted.jsonl` and it is
-        judged again from its start (`round_in_play.json`, or the round's own rows in a run that wrote none). Either way each agent first
-        gets back the session state it held, and the rounds left are played as `run_loop` plays them. The resumption goes in `config.json`.
+        judged again from its start (`round_in_play.json`, or the round's own rows in a run that wrote none). With `past_stable`, a run
+        that ended with both sides holding goes on from the next round with the same note and instructions, nothing being judged or asked
+        again, and stops again at the next round both sides hold in. Each agent first gets back the session state it held, and the rounds
+        left are played as `run_loop` plays them. The resumption goes in `config.json`.
 
         Args:
             flows: the Flows of the split, the same the run judged.
             examples: the labeled Examples, the same the run used.
             spec: the spec the run was started with (`spec_of`).
             run_dir: the run directory, holding the rows and rounds judged before the stop.
+            past_stable: go on past a last round both sides held in (`read_resumable`).
 
         Returns:
             Every round of the run, those judged before the stop included.
@@ -613,9 +653,12 @@ class Orchestrator:
         Raises:
             ValueError: when the run ended in order, or was cut off before anything recorded how its round started.
         """
-        history = read_resumable(run_dir)
+        history = read_resumable(run_dir, past_stable)
         run = _Run(flows, examples, spec, run_dir, self._run_fields(spec))
         rows = _rows_by_round(run_dir)
+        if history and history[-1].why_adapted == STABLE and _next_round_left_nothing(run_dir, history, rows):
+            _note_resumption(run_dir, history[-1].round, STABLE)
+            return self._play_on(run, run_dir, history, rows)
         if failure_of(history) is None:
             resumption = self._cut_off_resumption(
                 run, _Resumption(run_dir, history, rows, _round_start(run_dir, history, rows, spec), None)
@@ -652,9 +695,7 @@ class Orchestrator:
     def _go_on(self, run: _Run, resumption: _Resumption) -> list[RoundRecord]:
         """Go on from the round a run stopped in: ask its sides again when they were told of it, else judge it again from its start."""
         run_dir, history, start, judged = resumption.run_dir, resumption.history, resumption.start, resumption.judged
-        told = history if judged is None else [*history, judged]
-        self.attacker.restore(_told_attacker(run_dir, told, resumption.rows, run.spec))
-        self.defender.restore()
+        self._restore(run_dir, history if judged is None else [*history, judged], resumption.rows, run.spec)
         state = _resumed_state(run_dir, history, start, resumption.rows, run.spec)
         if judged is None:
             _set_aside(run_dir, start.round)
@@ -663,6 +704,19 @@ class Orchestrator:
         history.append(self._adapt_again(run, state, judged, resumption.rows[start.round]))
         _rewrite_rounds(run_dir, history)
         return history if history[-1].who_adapts is None else self._play(run, state, history, start.round + 1)
+
+    def _play_on(self, run: _Run, run_dir: Path, history: list[RoundRecord], rows: dict[int, list[Prediction]]) -> list[RoundRecord]:
+        """Go on past the last round, which both sides held in, from the same note and instructions, as if the loop had not stopped."""
+        held = history[-1]
+        self._restore(run_dir, history, rows, run.spec)
+        state = _resumed_state(run_dir, history[:-1], _RoundStart.of(held), rows, run.spec)
+        _move_on(state, held.note, _outcome_of(held, rows[held.round]).evaluation.attack_verdicts)
+        return self._play(run, state, history, held.round + 1)
+
+    def _restore(self, run_dir: Path, told: Sequence[RoundRecord], rows: dict[int, list[Prediction]], spec: AdversarialSpec) -> None:
+        """Give each agent back the session state it held once told of the rounds in `told`."""
+        self.attacker.restore(_told_attacker(run_dir, told, rows, spec))
+        self.defender.restore()
 
     def _play(self, run: _Run, state: RoundState, history: list[RoundRecord], start: int) -> list[RoundRecord]:
         """Judge rounds `start` to `max_rounds` from `state`, each added to `history` and `rounds.jsonl`, until one ends the loop."""
@@ -680,8 +734,7 @@ class Orchestrator:
         outcome = _outcome_of(stopped, rows)
         turn = decide_who_adapts(_evidence(state, outcome), run.spec.noise_margin)
         adaptation = self._adapt(turn, _feedback(state, outcome), state)
-        state.previous_note, state.previous_verdicts = stopped.note, outcome.evaluation.attack_verdicts
-        state.first_note = state.first_note or stopped.note or None
+        _move_on(state, stopped.note, outcome.evaluation.attack_verdicts)
         return replace(stopped, **asdict(adaptation))
 
     def _step_round(self, run: _Run, state: RoundState) -> RoundRecord:
@@ -702,8 +755,7 @@ class Orchestrator:
         judged = _judged_record(state, outcome, state_code_for(note, version.label, state.first_note))
         # Closing the round before the state moves on, because the turn rule compares the note with the previous round's.
         adaptation = self._close_round(run.spec, state, outcome)
-        state.previous_note, state.previous_verdicts = note, evaluation.attack_verdicts
-        state.first_note = state.first_note or note or None
+        _move_on(state, note, evaluation.attack_verdicts)
         return replace(judged, attempts_left=attempts_left, **asdict(adaptation))
 
     def _put_in_force(self, run_dir: Path | None, instructions: str) -> _Version:
@@ -948,17 +1000,20 @@ def spec_of(run_dir: Path) -> AdversarialSpec:
     )
 
 
-def resume_adversarial(run_dir: Path) -> tuple[Path, list[RoundRecord]]:
-    """Go on with a run that stopped on a failure, in its own folder (`Orchestrator.resume_loop`), with the spec it started with.
+def resume_adversarial(run_dir: Path, past_stable: bool = False) -> tuple[Path, list[RoundRecord]]:
+    """Go on with a run that stopped before its end, in its own folder (`Orchestrator.resume_loop`), with the spec it started with.
 
-    The agents reopen the sessions they last ran in, after each model answers the trivial question, as at the start of a run.
+    With `past_stable`, a run that ended with both sides holding goes on past that round. The agents reopen the sessions they last ran
+    in, after each model answers the trivial question, as at the start of a run.
 
     Raises:
-        ValueError: when the run did not stop on a failure.
+        ValueError: when the run ended in order (`read_resumable`).
         AgentUnavailableError: when an agent's model fails its trivial question.
     """
-    read_resumable(run_dir)
+    read_resumable(run_dir, past_stable)
     spec = spec_of(run_dir)
     setup = _prepare(spec)
     memory_dir = spec.memory_dir or run_dir / "memory"
-    return run_dir, _with_agents(setup, memory_dir, True, lambda loop: loop.resume_loop(setup.flows, setup.examples, spec, run_dir))
+    return run_dir, _with_agents(
+        setup, memory_dir, True, lambda loop: loop.resume_loop(setup.flows, setup.examples, spec, run_dir, past_stable)
+    )

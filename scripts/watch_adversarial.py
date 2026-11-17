@@ -100,12 +100,19 @@ def show_round_in_play(follow: Follow) -> None:
         follow.calls_reported = reported
 
 
+def judging_next(follow: Follow) -> bool:
+    """Whether the detector judged a Flow of the round after the last one shown, as in a run resumed past both sides holding."""
+    following = follow.rounds_shown + 1
+    return any(row.get("round") == following for row in read_lines(follow.run_dir / "predictions.jsonl"))
+
+
 def went_on(follow: Follow) -> bool:
     """Whether a run seen ending was resumed (`jev-ids resume`): its last round got an answer, or a round came after it."""
     rows = read_lines(follow.run_dir / "rounds.jsonl")
-    if len(rows) <= follow.rounds_shown and (not rows or rows[-1]["who_adapts"] is None):
+    later = len(rows) > follow.rounds_shown or judging_next(follow)
+    if not later and (not rows or rows[-1]["who_adapts"] is None):
         return False
-    print(f"== retomada: a execução segue a partir da rodada {follow.rounds_shown}", flush=True)
+    print(f"== retomada: a execução segue a partir da rodada {follow.rounds_shown + 1 if later else follow.rounds_shown}", flush=True)
     follow.ended = False
     return True
 
@@ -121,7 +128,7 @@ def look(results_dir: Path, follow: Follow | None) -> Follow | None:
     if follow.ended and not went_on(follow):
         return follow
     last = show_new_rounds(follow)
-    if last is not None and last["who_adapts"] is None:
+    if last is not None and last["who_adapts"] is None and not judging_next(follow):
         print(f"== fim: {last['why_adapted']} na rodada {last['round']}; aguardando uma retomada ou a próxima execução", flush=True)
         follow.ended = True
     else:

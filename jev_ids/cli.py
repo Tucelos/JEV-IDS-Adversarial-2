@@ -139,8 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     tuner.set_defaults(handler=threshold_command)
 
     _add_adversarial_parser(commands)
-    resumer = commands.add_parser("resume", help="go on with an adversarial run that stopped on a failure, from the round it stopped in")
+    resumer = commands.add_parser("resume", help="go on with an adversarial run that stopped before its end, from the round it stopped in")
     resumer.add_argument("run_dir", type=Path, help="results/adv_* directory of the run that stopped")
+    resumer.add_argument(
+        "--past-stable",
+        action="store_true",
+        help="go on past a last round in which both sides held, from the same note and instructions; the loop stops again at the "
+        "next such round",
+    )
     resumer.set_defaults(handler=resume_command)
     return parser
 
@@ -272,13 +278,14 @@ def adversarial_command(args: argparse.Namespace) -> None:
 
 
 def resume_command(args: argparse.Namespace) -> None:
-    """`resume`: go on with an adversarial run that stopped on a failure, and print every round of it as `adversarial` does.
+    """`resume`: go on with an adversarial run that stopped before its end, and print every round of it as `adversarial` does.
 
-    The command exits non-zero when the run did not stop on a failure, when an agent's model fails its question before going on, and,
-    after the rounds are printed, when the loop stopped again.
+    With `--past-stable`, a run that ended with both sides holding goes on too, past that round. The command exits non-zero when the
+    run ended in order, when an agent's model fails its question before going on, and, after the rounds are printed, when the loop
+    stopped again.
     """
     try:
-        run_dir, history = adversarial.resume_adversarial(args.run_dir)
+        run_dir, history = adversarial.resume_adversarial(args.run_dir, args.past_stable)
     except AgentUnavailableError as exc:
         raise SystemExit(f"agent model unavailable before going on, no detector call was made ({exc})") from exc
     except ValueError as exc:

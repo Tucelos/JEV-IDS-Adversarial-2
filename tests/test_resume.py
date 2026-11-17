@@ -18,6 +18,8 @@ from jev_ids.dataset import Flow
 from tests.adversarial_helpers import (
     ATTACKER_SCRIPT,
     DEFENDER_SCRIPT,
+    HOLDING_ATTACKER,
+    HOLDING_DEFENDER,
     STUDY_FLOWS,
     AgentFactory,
     Loop,
@@ -58,9 +60,9 @@ def play(loop: Loop, agents: AgentFactory) -> list[RoundRecord]:
     return loop.orchestrator.run_loop(STUDY_FLOWS, [], make_spec(agents.root), out_dir=run_dir_of(agents))
 
 
-def resume(loop: Loop, agents: AgentFactory) -> list[RoundRecord]:
-    """Go on with the run in the factory's run folder."""
-    return loop.orchestrator.resume_loop(STUDY_FLOWS, [], make_spec(agents.root), run_dir_of(agents))
+def resume(loop: Loop, agents: AgentFactory, past_stable: bool = False) -> list[RoundRecord]:
+    """Go on with the run in the factory's run folder, past a last round both sides held in with `past_stable`."""
+    return loop.orchestrator.resume_loop(STUDY_FLOWS, [], make_spec(agents.root), run_dir_of(agents), past_stable)
 
 
 def resumptions(run_dir: Path) -> list[tuple[Any, Any]]:
@@ -203,7 +205,61 @@ def test_a_run_cut_off_while_a_side_was_deciding_asks_that_side_again(
     assert resumptions(run_dir) == [(2, "cut_off")]
 
 
-def test_a_run_that_ended_in_order_is_not_resumed(straight: AgentFactory) -> None:
-    play(straight.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT), straight)
-    with pytest.raises(ValueError, match="ended in order"):
-        read_resumable(run_dir_of(straight))
+@pytest.mark.parametrize("past_stable", [False, True])
+def test_a_run_that_ended_on_its_last_round_is_not_resumed(straight: AgentFactory, past_stable: bool) -> None:
+    history = play(straight.loop(ATTACKER_SCRIPT, DEFENDER_SCRIPT), straight)
+    assert history[-1].why_adapted == "max_rounds_reached"
+    with pytest.raises(ValueError, match=r"ended in order \(max_rounds_reached\), so there is nothing to resume$"):
+        read_resumable(run_dir_of(straight), past_stable)
+
+
+def test_a_run_both_sides_held_in_is_resumed_only_past_that_round(broken: AgentFactory) -> None:
+    stopped = play(broken.loop(HOLDING_ATTACKER[:2], HOLDING_DEFENDER[:2]), broken)
+    assert [record.why_adapted for record in stopped] == ["attack_passed", "stable"]
+    with pytest.raises(ValueError, match=r"ended in order \(stable\), so there is nothing to resume; `--past-stable` goes on"):
+        read_resumable(run_dir_of(broken))
+    assert read_resumable(run_dir_of(broken), past_stable=True) == stopped
+
+
+def test_a_run_resumed_past_both_sides_holding_goes_on_until_they_hold_again(broken: AgentFactory) -> None:
+    stopped = play(broken.loop(HOLDING_ATTACKER[:2], HOLDING_DEFENDER[:2]), broken)
+    broken.restart()
+    # The new process is given the decisions of rounds 3 and 4: the defender reinforces in round 3, and both sides hold in round 4.
+    history = resume(broken.loop(HOLDING_ATTACKER[2:], HOLDING_DEFENDER[2:], reopen=True), broken, past_stable=True)
+    assert history[:2] == stopped
+    assert [record.why_adapted for record in history] == ["attack_passed", "stable", "attack_passed", "stable"]
+    assert [record.who_adapts for record in history] == ["attacker", None, "defender", None]
+    # Round 3 starts as round 2 ended: the same note, the same instructions and the attempts that were left.
+    assert [record.state_code for record in history] == ["N/B", "S/B", "S/B", "S/R"]
+    assert history[2].attempts_left == history[1].attempts_left
+    run_dir = run_dir_of(broken)
+    assert read_rounds(run_dir) == history
+    # Round 2 is neither judged nor asked again: each round has its rows once, and none was set aside.
+    rows = read_jsonl(run_dir / "predictions.jsonl")
+    assert [row["round"] for row in rows] == [record.round for record in history for _ in STUDY_FLOWS]
+    assert not (run_dir / "interrupted.jsonl").exists()
+    assert resumptions(run_dir) == [(2, "stable")]
+    # Round 4, which both sides held in too, ends the run again.
+    with pytest.raises(ValueError, match=r"ended in order \(stable\)"):
+        read_resumable(run_dir)
+
+
+def test_a_run_resumed_past_both_sides_holding_and_cut_off_is_taken_up_without_asking_again(
+    straight: AgentFactory, broken: AgentFactory
+) -> None:
+    for agents in (straight, broken):
+        play(agents.loop(HOLDING_ATTACKER[:2], HOLDING_DEFENDER[:2]), agents)
+        agents.restart()
+    reference = straight.loop(HOLDING_ATTACKER[2:], HOLDING_DEFENDER[2:], reopen=True)
+    expected = resume(reference, straight, past_stable=True)
+    # The other process goes down on the third call of round 3, and a plain `resume` takes it up: it went past round 2 already.
+    with pytest.raises(Killed):
+        resume(broken.loop(HOLDING_ATTACKER[2:], HOLDING_DEFENDER[2:], DyingDetector(die_at=3), reopen=True), broken, past_stable=True)
+    broken.restart()
+    resumed = broken.loop(HOLDING_ATTACKER[2:], HOLDING_DEFENDER[2:], reopen=True)
+    assert resume(resumed, broken) == expected
+    run_dir = run_dir_of(broken)
+    assert [row["round"] for row in read_jsonl(run_dir / "interrupted.jsonl")] == [3, 3]
+    assert resumptions(run_dir) == [(2, "stable"), (3, "cut_off")]
+    assert resumed.attacker.memory.state == reference.attacker.memory.state
+    assert resumed.defender.memory.state == reference.defender.memory.state

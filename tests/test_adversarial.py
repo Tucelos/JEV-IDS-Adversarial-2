@@ -20,6 +20,8 @@ from tests.adversarial_helpers import (
     ATTACKER_SCRIPT,
     BASE_INSTRUCTIONS,
     DEFENDER_SCRIPT,
+    HOLDING_ATTACKER,
+    HOLDING_DEFENDER,
     LOUD,
     NSL_KDD_CARD,
     REINFORCED_INSTRUCTIONS,
@@ -345,6 +347,23 @@ def test_cli_resume_refuses_a_run_that_ended_in_order_and_a_model_that_fails_fir
     install_doubles(monkeypatch, MockDecisionDetector(), [RuntimeError("401 invalid key")], ["OK"])
     with pytest.raises(SystemExit, match="unavailable before going on, no detector call was made"):
         cli.main(["resume", str(stopped)])
+
+
+def test_cli_resumes_a_run_past_a_round_both_sides_held_in_only_when_asked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Round 1: the defender keeps B and the attacker removes its note; in round 2 both keep, and the run stops.
+    install_doubles(monkeypatch, MockDecisionDetector(), ["OK", *HOLDING_ATTACKER[:2]], ["OK", *HOLDING_DEFENDER[:2]])
+    assert cli.main(cli_args(tmp_path, "--rounds", "3")) == 0
+    (run_dir,) = tmp_path.glob("adv_nsl-kdd_jev_*")
+    with pytest.raises(SystemExit, match=r"ended in order \(stable\).*`--past-stable` goes on"):
+        cli.main(["resume", str(run_dir)])
+    # Going on asks each model its question again, and round 3, the last, asks no side anything.
+    install_doubles(monkeypatch, MockDecisionDetector(), ["OK"], ["OK"])
+    assert cli.main(["resume", str(run_dir), "--past-stable"]) == 0
+    history = [RoundRecord(**line) for line in read_jsonl(run_dir / "rounds.jsonl")]
+    assert column(history, "why_adapted") == ["attack_passed", "stable", "max_rounds_reached"]
+    assert column(history, "state_code") == ["N/B", "S/B", "S/B"]
+    config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    assert [(entry["round"], entry["after"]) for entry in config["resumed"]] == [(2, "stable")]
 
 
 def test_cli_names_the_run_folder_without_the_colon_of_an_llm_detector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

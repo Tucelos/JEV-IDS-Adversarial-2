@@ -153,6 +153,10 @@ def defender_says(action: str, instructions: str = "", label: str = "?", rationa
 # The labels the defender's model writes are wrong on purpose, because the loop must not read them.
 ATTACKER_SCRIPT = [attacker_says("remove"), attacker_says("reformulate", "ticket-4821")]
 DEFENDER_SCRIPT = [defender_says("reinforce", label="V9"), defender_says("relax", label="R")]
+# Scripting a cycle in which both sides hold twice: in round 2, after the attacker removed its note, and in round 4, after the
+# defender reinforced in round 3. A run stops at round 2; resumed past it (`past_stable`), it plays round 3 and stops at round 4.
+HOLDING_ATTACKER = [attacker_says("remove"), attacker_says("keep"), attacker_says("keep")]
+HOLDING_DEFENDER = [defender_says("keep"), defender_says("keep"), defender_says("reinforce"), defender_says("keep")]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
