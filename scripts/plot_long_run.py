@@ -6,11 +6,17 @@ Run from the repository root. matplotlib is not a project dependency, so bring i
 
 For every run given, it reads `config.json` and `rounds.jsonl` and writes, in `results/comparison/`:
 
-- `laco_longo.csv`: one row per run and round, with the detection rate taken over the attacks the detector answered.
+- `laco_longo.csv`: one row per run and round, with the detection rate taken over the attacks the detector answered, and the
+  accuracy and balanced accuracy taken over every record it answered.
 - `laco_longo_<detector>.png`: the run read round by round: detection, its moving mean and false alarm, with the side the
   orchestrator chose to adapt after each round underneath (green defender, red attacker, grey end), and a dotted line where the run
   was resumed past a round both sides held in (`jev-ids resume --past-stable`).
-- `laco_longo_melhora.png`: the mean detection, false alarm and F1 of the first and the last rounds of each run, side by side.
+- `laco_longo_melhora.png`: the mean detection, false alarm, F1, accuracy and balanced accuracy of the first and the last rounds
+  of each run, side by side.
+
+Most records of the split are attacks (31 of 50), so a detector that alerts on every record already scores an accuracy of 0.62 and
+an F1 of 0.77. The balanced accuracy, the mean of the share of attacks caught and the share of normal records let through, weighs
+both classes alike and drops to 0.5 for that detector, which is why it shows a detector's false alarms where F1 hides them.
 
 It prints, per run, how many rounds were judged, how the loop ended, how many new wordings the attacker spent and how many
 instruction versions the defender put in force. Each run is one non-deterministic trajectory, not an average.
@@ -32,7 +38,13 @@ WHO_NAMES = {"defender": "defensor adapta", "attacker": "atacante adapta", "": "
 MOVING_WINDOW = 5
 # Comparing the mean of the first and the last this many rounds of a run.
 PHASE_ROUNDS = 10
-METRICS = (("detection_rate", "Detecção"), ("false_alarm_rate", "Falso alarme"), ("f1", "F1"))
+METRICS = (
+    ("detection_rate", "Detecção"),
+    ("false_alarm_rate", "Falso alarme"),
+    ("f1", "F1"),
+    ("accuracy", "Acurácia"),
+    ("balanced_accuracy", "Acurácia bal."),
+)
 CSV_FIELDS: tuple[str, ...] = (
     "detector",
     "run",
@@ -46,6 +58,8 @@ CSV_FIELDS: tuple[str, ...] = (
     "false_alarms",
     "false_alarm_rate",
     "f1",
+    "accuracy",
+    "balanced_accuracy",
     "attempts_left",
     "who_adapts",
     "why_adapted",
@@ -73,6 +87,20 @@ def detection_rate(row: dict[str, Any]) -> float:
     return row["attacks_detected"] / answered if answered else 0.0
 
 
+def accuracy(row: dict[str, Any]) -> float:
+    """The share of the answered records, attacks and normal ones, that the detector judged right; 0 when it answered none."""
+    benign = row["total_benign"] - row["benign_errors"]
+    answered = row["attacks_detected"] + row["attacks_passed"] + benign
+    return (row["attacks_detected"] + benign - row["false_alarms"]) / answered if answered else 0.0
+
+
+def balanced_accuracy(row: dict[str, Any]) -> float:
+    """The mean of the share of answered attacks that alerted and the share of answered normal records that did not."""
+    benign = row["total_benign"] - row["benign_errors"]
+    let_through = (benign - row["false_alarms"]) / benign if benign else 0.0
+    return (detection_rate(row) + let_through) / 2
+
+
 def load_run(run_dir: Path) -> Run:
     """Read a run's detector and budget from `config.json` and its rounds from `rounds.jsonl`, with each round's detection rate."""
     config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
@@ -80,6 +108,8 @@ def load_run(run_dir: Path) -> Run:
     rows = [json.loads(line) for line in lines if line.strip()]
     for row in rows:
         row["detection_rate"] = detection_rate(row)
+        row["accuracy"] = accuracy(row)
+        row["balanced_accuracy"] = balanced_accuracy(row)
     detector: str = config["detector"]
     past_stable = sorted({entry["round"] for entry in config.get("resumed", []) if entry["after"] == "stable"})
     return Run(detector, LABELS.get(detector, detector), run_dir.name, config["max_attempts"], rows, past_stable)
@@ -177,11 +207,11 @@ def draw_phase_bars(axis: Any, run: Run) -> None:
 
 def plot_improvement(runs: list[Run], path: Path) -> None:
     """Per run, each metric's mean over the first and the last rounds, as two bars side by side."""
-    figure, axes = plt.subplots(1, len(runs), figsize=(6 * len(runs), 4.6), squeeze=False)
+    figure, axes = plt.subplots(1, len(runs), figsize=(7.5 * len(runs), 4.6), squeeze=False)
     for axis, run in zip(axes[0], runs, strict=True):
         draw_phase_bars(axis, run)
     axes[0][0].set_ylabel("média na fase")
-    figure.suptitle("Começo e fim de cada execução: detecção e F1 devem subir, falso alarme cair", fontsize=12)
+    figure.suptitle("Começo e fim de cada execução: detecção, F1 e acurácias devem subir, falso alarme cair", fontsize=12)
     figure.tight_layout()
     figure.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(figure)
