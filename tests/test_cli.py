@@ -1,6 +1,8 @@
 """CLI wiring for the run, redo-errors, metrics, compare, sign-test and threshold subcommands."""
 
+import io
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -41,6 +43,16 @@ def test_run_builds_a_spec_from_the_arguments(tmp_path: Path, capsys: pytest.Cap
     # Completing the run in place, which judges nothing because it holds neither an error row nor a missing Flow.
     assert cli.main(["redo-errors", str(run_dir)]) == 0
     assert capsys.readouterr().out.splitlines()[-1] == f"redone: 0 error rows and 0 missing flows of {run_dir}"
+
+
+def test_the_csv_is_written_in_utf8_where_stdout_defaults_to_a_narrower_code_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252", newline="\n"))
+    cli.use_utf8_stdout()
+    # An arrow, as a defender's rationale may hold, has no place in cp1252.
+    cli.print_csv([{"rationale": "keep \u2192 V7"}])
+    sys.stdout.flush()
+    assert raw.getvalue().decode("utf-8") == "rationale\nkeep \u2192 V7\n"
 
 
 def test_metrics_prints_one_csv_over_every_run_given(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

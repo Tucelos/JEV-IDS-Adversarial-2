@@ -327,8 +327,20 @@ def print_csv(rows: Sequence[dict[str, Any]]) -> None:
     writer.writerows(rows)
 
 
+def use_utf8_stdout() -> None:
+    """Write stdout in UTF-8 where it defaults to a narrower code page, as a redirected stdout does on Windows (cp1252).
+
+    The notes and rationales the agents write may hold any character, such as an arrow, and a CSV row that the code page cannot
+    encode would stop the command after the run ended, with every round already saved.
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None and sys.stdout.encoding.lower().replace("-", "") != "utf8":
+        reconfigure(encoding="utf-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Load the secrets of `.env`, parse the command line and call the subcommand's handler."""
+    use_utf8_stdout()
     # Loading the API keys from `.env`, which stays out of git (README),
     # here because both the console script and `python -m jev_ids` pass through.
     load_dotenv(ROOT / ".env")
