@@ -8,7 +8,8 @@ For every run given, it reads `config.json` and `rounds.jsonl` and writes, in `r
 
 - `laco_longo.csv`: one row per run and round, with the detection rate taken over the attacks the detector answered.
 - `laco_longo_<detector>.png`: the run read round by round: detection, its moving mean and false alarm, with the side the
-  orchestrator chose to adapt after each round underneath (green defender, red attacker, grey end).
+  orchestrator chose to adapt after each round underneath (green defender, red attacker, grey end), and a dotted line where the run
+  was resumed past a round both sides held in (`jev-ids resume --past-stable`).
 - `laco_longo_melhora.png`: the mean detection, false alarm and F1 of the first and the last rounds of each run, side by side.
 
 It prints, per run, how many rounds were judged, how the loop ended, how many new wordings the attacker spent and how many
@@ -53,13 +54,17 @@ CSV_FIELDS: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class Run:
-    """One adversarial run: its detector, its folder, the attacker's budget and one row per judged round."""
+    """One adversarial run: its detector, its folder, the attacker's budget, one row per judged round, and the rounds it went past.
+
+    `past_stable` holds each round both sides held in that the run was resumed past, as `config.json` records the resumption.
+    """
 
     detector: str
     label: str
     folder: str
     max_attempts: int
     rows: list[dict[str, Any]]
+    past_stable: list[int]
 
 
 def detection_rate(row: dict[str, Any]) -> float:
@@ -76,7 +81,8 @@ def load_run(run_dir: Path) -> Run:
     for row in rows:
         row["detection_rate"] = detection_rate(row)
     detector: str = config["detector"]
-    return Run(detector, LABELS.get(detector, detector), run_dir.name, config["max_attempts"], rows)
+    past_stable = sorted({entry["round"] for entry in config.get("resumed", []) if entry["after"] == "stable"})
+    return Run(detector, LABELS.get(detector, detector), run_dir.name, config["max_attempts"], rows, past_stable)
 
 
 def moving_mean(values: list[float], window: int) -> list[float]:
@@ -120,11 +126,16 @@ def plot_trajectory(run: Run, path: Path) -> None:
     smoothed = moving_mean(detection, MOVING_WINDOW)
     top.plot(rounds, smoothed, color="#0072B2", linewidth=2.6, label=f"Detecção, média de {MOVING_WINDOW} rodadas")
     top.plot(rounds, [row["false_alarm_rate"] for row in run.rows], color="#555555", linestyle="--", linewidth=1.6, label="Falso alarme")
+    for index, held in enumerate(run.past_stable):
+        label = "retomada depois de um stable" if index == 0 else None
+        top.axvline(held + 0.5, color="#7f7f7f", linestyle=":", linewidth=1.6, label=label)
     top.set_xlim(0.5, max(rounds) + 0.5)
-    top.set_ylim(-0.05, 1.05)
+    # Leaving a band above 1.0 for the legend, so it hides no round of the lines.
+    top.set_ylim(-0.05, 1.2)
+    top.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     top.set_ylabel("proporção")
     top.grid(visible=True, alpha=0.3)
-    top.legend(loc="lower right", fontsize=9)
+    top.legend(loc="upper center", ncol=4, fontsize=9, frameon=False)
     top.set_title(f"O laço adversarial em {len(rounds)} rodadas — detector {run.label}", fontsize=12)
     draw_strip(strip, run.rows)
     strip.set_xticks([1, *range(5, max(rounds) + 1, 5)])
@@ -182,9 +193,10 @@ def describe(run: Run) -> str:
     versions = len({row["instruction_label"] for row in run.rows})
     unanswered = sum(row["attack_errors"] + row["benign_errors"] for row in run.rows)
     spent = run.max_attempts - last["attempts_left"]
+    went_past = f", resumed past the stable round(s) {run.past_stable}" if run.past_stable else ""
     return (
         f"{run.label}: {len(run.rows)} rounds, ended by {last['why_adapted']}, {spent} of {run.max_attempts} new wordings spent, "
-        f"{versions} instruction versions, {unanswered} unanswered records"
+        f"{versions} instruction versions, {unanswered} unanswered records{went_past}"
     )
 
 
