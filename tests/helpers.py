@@ -12,6 +12,7 @@ import pytest
 from jev_ids.dataset import Config, Flow, split_header, write_split
 from jev_ids.rate_limit import PATIENT_WAITS, CallSpacer, SpacedTransport
 from jev_ids.records import Prediction
+from jev_ids.streamed_chat import StreamedChatTransport
 
 # Defining a three-feature card with one symbolic feature and three Categories.
 CONFIG: Config = {
@@ -180,10 +181,17 @@ class FakeClock:
 Gateway = Callable[[httpx.Request], httpx.Response]
 
 
+def sse(chunks: Sequence[dict[str, Any]], done: bool = True) -> bytes:
+    """A server-sent event stream carrying `chunks`, closed by `[DONE]` unless the stream breaks off."""
+    events = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    return (events + ("data: [DONE]\n\n" if done else "")).encode("utf-8")
+
+
 def fake_transport(gateway: Gateway, clock: FakeClock, waits: Sequence[float] = ()) -> SpacedTransport:
-    """A TokenLab transport over `gateway`, spaced at 20 calls a minute on `clock`, with `waits` before each new attempt."""
+    """A TokenLab transport over `gateway`, built as `spaced_transport` builds one: spaced at 20 calls a minute on `clock`, with
+    `waits` before each new attempt, and a chat request sent as a stream."""
     spacer = CallSpacer(20, clock=clock.time, sleep=clock.sleep)
-    return SpacedTransport(spacer, waits, inner=httpx.MockTransport(gateway), sleep=clock.sleep)
+    return SpacedTransport(spacer, waits, inner=StreamedChatTransport(httpx.MockTransport(gateway)), sleep=clock.sleep)
 
 
 def fake_spaced_transport(

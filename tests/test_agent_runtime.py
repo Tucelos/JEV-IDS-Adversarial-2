@@ -28,7 +28,7 @@ from jev_ids.agent_runtime import (
 from jev_ids.agents import AttackerDecision, RetiredNote
 from jev_ids.rate_limit import PATIENT_WAITS
 from tests.adversarial_helpers import ScriptedAgnoModel, attacker_says
-from tests.helpers import FakeClock, fake_spaced_transport
+from tests.helpers import FakeClock, fake_spaced_transport, sse
 
 
 def open_memory(memory_dir: Path, model: ScriptedAgnoModel) -> AgentMemory:
@@ -191,22 +191,22 @@ def test_ledger_records_outlive_the_process_only_through_the_memory_folder(tmp_p
 
 
 def chat_gateway(*statuses: int) -> Callable[[httpx.Request], httpx.Response]:
-    """An OpenAI-compatible gateway giving each request the next status; a 200 carries a completion in which the attacker keeps."""
+    """An OpenAI-compatible gateway giving each request the next status; a 200 streams a completion in which the attacker keeps."""
     queue = list(statuses)
 
     def answer(request: httpx.Request) -> httpx.Response:
         status = queue.pop(0)
         if status != 200:
             return httpx.Response(status, json={"error": {"message": "The model service is temporarily unavailable."}}, request=request)
-        completion = {
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "Qwen3.8-27B",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": attacker_says("keep")}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        }
-        return httpx.Response(200, json=completion, request=request)
+        # The transport sends the SDK's plain request as a stream, so that is what reaches the gateway.
+        assert json.loads(request.content)["stream"] is True
+        head = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B"}
+        delta = {"role": "assistant", "content": attacker_says("keep")}
+        chunks: list[dict[str, Any]] = [
+            {**head, "choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}]},
+            {**head, "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        ]
+        return httpx.Response(200, content=sse(chunks), headers={"content-type": "text/event-stream"}, request=request)
 
     return answer
 

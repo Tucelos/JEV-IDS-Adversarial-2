@@ -12,6 +12,9 @@ temporarily unavailable. The transport here deals with both before a response re
   response is given back, or the last failure raised, for the caller's own policy to read: a gateway that stays down still ends
   the run with its error, and a permanent refusal is given back at once.
 
+A chat request also travels as a stream (`streamed_chat.py`), because the gateway cuts a plain one that waits in its queue for about a
+minute, which made every patient retry of a busy hour fail the same way.
+
 The spacer lives in one process: two runs on the same key must go one after the other, never side by side.
 
 In reading order:
@@ -34,6 +37,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from jev_ids.detectors import RETRYABLE_STATUS
+from jev_ids.streamed_chat import StreamedChatTransport
 
 CEILING_PER_MINUTE = 20.0
 DEFAULT_CALLS_PER_MINUTE = 18.0
@@ -171,5 +175,9 @@ class SpacedTransport(httpx.BaseTransport):
 
 
 def spaced_transport(base_url: str, waits: Sequence[float] = PATIENT_WAITS) -> SpacedTransport:
-    """A transport on the shared spacer of the host of `base_url`, with the caller's patient waits."""
-    return SpacedTransport(spacer_for(base_url), waits)
+    """A transport on the shared spacer of the host of `base_url`, with the caller's patient waits.
+
+    Each attempt goes out through `StreamedChatTransport`, so a chat request travels as a stream, which TokenLab's gateway keeps in its
+    queue instead of cutting it after a minute; any other request goes out as it is.
+    """
+    return SpacedTransport(spacer_for(base_url), waits, inner=StreamedChatTransport(httpx.HTTPTransport()))

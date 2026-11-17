@@ -100,6 +100,16 @@ def show_round_in_play(follow: Follow) -> None:
         follow.calls_reported = reported
 
 
+def went_on(follow: Follow) -> bool:
+    """Whether a run seen ending was resumed (`jev-ids resume`): its last round got an answer, or a round came after it."""
+    rows = read_lines(follow.run_dir / "rounds.jsonl")
+    if len(rows) <= follow.rounds_shown and (not rows or rows[-1]["who_adapts"] is None):
+        return False
+    print(f"== retomada: a execução segue a partir da rodada {follow.rounds_shown}", flush=True)
+    follow.ended = False
+    return True
+
+
 def look(results_dir: Path, follow: Follow | None) -> Follow | None:
     """One look at the results: follow the newest run, and print what it did since the last look."""
     newest = newest_run(results_dir)
@@ -108,11 +118,11 @@ def look(results_dir: Path, follow: Follow | None) -> Follow | None:
     if follow is None or newest != follow.run_dir:
         follow = Follow(newest)
         print_header(newest)
-    if follow.ended:
+    if follow.ended and not went_on(follow):
         return follow
     last = show_new_rounds(follow)
     if last is not None and last["who_adapts"] is None:
-        print(f"== fim: {last['why_adapted']} na rodada {last['round']}; aguardando a próxima execução", flush=True)
+        print(f"== fim: {last['why_adapted']} na rodada {last['round']}; aguardando uma retomada ou a próxima execução", flush=True)
         follow.ended = True
     else:
         show_round_in_play(follow)
