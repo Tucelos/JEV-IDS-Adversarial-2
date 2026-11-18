@@ -14,5 +14,6 @@ matplotlib.use("Agg")
 plt: Any = importlib.import_module("matplotlib.pyplot")
 patches: Any = importlib.import_module("matplotlib.patches")
 
-# Who the orchestrator chose to adapt after a round, in the colours the loop diagrams use: green defender, red attacker, grey end.
-WHO_COLORS: dict[str, str] = {"defender": "#2ca02c", "attacker": "#d62728", "": "#9e9e9e"}
+# Who the orchestrator chose to adapt after a round, green defender and red attacker as in the loop diagrams, grey end. The green
+# and the red are the bluish green and the vermillion of Okabe and Ito, which a reader with red-green colour blindness tells apart.
+WHO_COLORS: dict[str, str] = {"defender": "#009e73", "attacker": "#d55e00", "": "#9e9e9e"}
