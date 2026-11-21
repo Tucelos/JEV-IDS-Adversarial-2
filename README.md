@@ -2,17 +2,22 @@
 
 Este repositório é o protótipo do sistema adversarial proposto no Trabalho 1. Um atacante e um defensor, dois agentes com modelo de linguagem e memória própria, disputam rodadas diante do mesmo detector de intrusões. O atacante escreve uma nota no campo `service` dos registros de ataque do NSL-KDD para que eles passem sem alerta. O defensor reescreve as instruções que o detector recebe. Um orquestrador sem modelo julga cada rodada, entrega a cada lado apenas o que ele pode ver e decide, por uma regra fixa, quem adapta em seguida. A base é o Jev IDS, um benchmark de detecção de intrusões de outros autores.
 
-> **Atribuição.** Este repositório é uma cópia modificada do Jev IDS ([`jev-sec/jev-ids`](https://github.com/jev-sec/jev-ids)) no commit `71e57a7`, projeto publicado sob a licença MIT por Paulo Severo, Silvio Quincozes e Amanda Dias. É deles tudo o que não aparece na tabela abaixo: o laço de stream, o KController, o Selector, os detectores Jev, LLM e clássicos, os dados e os scripts que os preparam, os prompts, os resultados do benchmark em `results/`, a documentação em `docs/` (exceto `docs/dashboard.html`), o `Makefile`, o `CONTEXT.md` e os demais testes. O README original está restaurado, sem alterações, em [README.jev-ids.md](README.jev-ids.md).
+> **Atribuição.** Este repositório é uma cópia modificada do Jev IDS ([`jev-sec/jev-ids`](https://github.com/jev-sec/jev-ids)) no commit `71e57a7`, projeto publicado sob a licença MIT por Paulo Severo, Silvio Quincozes e Amanda Dias. É deles tudo o que não aparece na tabela abaixo: o laço de stream, o KController, o Selector, os detectores Jev, LLM e clássicos, os dados e os scripts que os preparam, os prompts, os resultados do benchmark em `results/` (exceto `results/adv_*` e `results/comparison/`), a documentação em `docs/` (exceto `docs/dashboard.html`), o `Makefile`, o `CONTEXT.md` e os demais testes. O README original está restaurado, sem alterações, em [README.jev-ids.md](README.jev-ids.md).
 
 | Situação | Arquivos | Papel |
 |---|---|---|
-| Adicionados | `jev_ids/adversarial.py`, `jev_ids/turns.py`, `jev_ids/evaluator.py` | orquestrador, regra de turno e avaliador de uma rodada |
+| Adicionados | `jev_ids/adversarial.py`, `jev_ids/turns.py`, `jev_ids/evaluator.py` | orquestrador (com a retomada de execuções paradas), regra de turno e avaliador de uma rodada |
 | Adicionados | `jev_ids/agents.py`, `jev_ids/agent_runtime.py` | os dois agentes, os vetos às suas respostas, seus modelos e suas memórias |
-| Adicionado | `jev_ids/detectors/gemini_decision.py` | detector Gemini Decision |
-| Adicionados | `tests/adversarial_helpers.py`, `tests/test_adversarial.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_evaluator.py`, `tests/test_turns.py`, `tests/test_gemini_decision.py` | testes offline do laço |
+| Adicionados | `jev_ids/detectors/gemini_decision.py`, `jev_ids/detectors/systemone.py` | detectores Gemini Decision e Clef (no TokenLab) |
+| Adicionados | `jev_ids/rate_limit.py`, `jev_ids/streamed_chat.py` | espaçador compartilhado das chamadas ao TokenLab e pedidos em stream do agente `qwen` |
+| Adicionados | `scripts/watch_adversarial.py`, `scripts/plotting.py`, `scripts/plot_detector_comparison.py`, `scripts/plot_long_run.py`, `scripts/plot_long_comparison.py` | monitor ao vivo e gráficos das execuções |
+| Adicionados | `tests/adversarial_helpers.py`, `tests/test_adversarial.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_evaluator.py`, `tests/test_turns.py`, `tests/test_gemini_decision.py`, `tests/test_systemone.py`, `tests/test_resume.py`, `tests/test_rate_limit.py`, `tests/test_streamed_chat.py` | testes offline do laço e do transporte do TokenLab |
 | Adicionados | `docs/dashboard.html`, `README.jev-ids.md` | reprodução visual do teste roteirizado; README original |
-| Alterado | `jev_ids/cli.py` | subcomando `adversarial` |
-| Alterados | `jev_ids/detectors/__init__.py`, `jev_ids/detectors/jev.py`, `jev_ids/detectors/llm.py`, `jev_ids/run.py` | interface `DecisionDetector`, que permite trocar as instruções do detector, e construção do `gemini_decision` |
+| Adicionados | `results/adv_*/`, `results/comparison/` | as execuções do laço e seus gráficos (seção 6) |
+| Alterado | `jev_ids/cli.py` | subcomandos `adversarial` e `resume`, e saída em UTF-8 |
+| Alterados | `jev_ids/detectors/__init__.py`, `jev_ids/detectors/jev.py`, `jev_ids/detectors/llm.py`, `jev_ids/run.py` | interface `DecisionDetector`, que permite trocar as instruções do detector, e construção do `gemini_decision` e do `systemone` |
+| Alterados | `tests/helpers.py`, `tests/test_cli.py` | dublês do TokenLab para os testes novos e teste da saída em UTF-8 |
+| Alterados | `docs/protocol.md`, `docs/results.md` | links para o README original, agora em `README.jev-ids.md` |
 | Alterados | `pyproject.toml`, `uv.lock`, `prices.json`, `.gitignore`, `README.md` | dependências, preços dos modelos novos, arquivos ignorados e este texto |
 
 ## 1. Escopo
@@ -29,7 +34,7 @@ A pergunta que o protótipo responde é a pergunta central do enunciado: **como 
 
 Os dois agentes estão em `jev_ids/agents.py`. Cada um é um `Agent` da biblioteca Agno (`jev_ids/agent_runtime.py`) com modelo próprio e um arquivo SQLite próprio (`attacker.db` ou `defender.db`) que o outro lado nunca abre. Na hora de decidir, o modelo vê as dez consultas anteriores da própria sessão, o estado da sessão e as linhas que o código grava na memória a cada rodada. As ferramentas de memória do Agno ficam desligadas: o modelo não pode alterar a própria memória.
 
-As instruções básicas `B` são o texto `state.instructions` de `prompts/nsl-kdd/jev.json` (detectores `gemini_decision` e `jev`) ou a seção `# Overview` de `prompts/nsl-kdd/llm.md` (detectores `llm:*`). As instruções reforçadas `R` são `B` mais uma cláusula que declara todo valor do registro, inclusive `service` e qualquer nota, dado de rede não confiável e nunca instrução (`REINFORCED_SUFFIX`, em `jev_ids/adversarial.py`). A nota inicial `N` alega manutenção autorizada e pede a classificação como normal (`INITIAL_NOTE`, alterável com `--initial-note`).
+As instruções básicas `B` são o texto `state.instructions` de `prompts/nsl-kdd/jev.json` (detectores `gemini_decision`, `systemone` e `jev`) ou a seção `# Overview` de `prompts/nsl-kdd/llm.md` (detectores `llm:*`). As instruções reforçadas `R` são `B` mais uma cláusula que declara todo valor do registro, inclusive `service` e qualquer nota, dado de rede não confiável e nunca instrução (`REINFORCED_SUFFIX`, em `jev_ids/adversarial.py`). A nota inicial `N` alega manutenção autorizada e pede a classificação como normal (`INITIAL_NOTE`, alterável com `--initial-note`).
 
 ### Atacante (`AttackerAgent`)
 
@@ -47,7 +52,7 @@ As instruções básicas `B` são o texto `state.instructions` de `prompts/nsl-k
 
 - **Objetivo:** o menor custo das instruções em vigor, com custo = ataques que passaram / ataques respondidos + falsos alarmes / registros normais respondidos.
 - **Ação:** `keep` (manter), `reinforce` (reforçar; sem texto próprio, vale `R`), `relax` (relaxar; sem texto próprio, vale `B`) ou `custom` (escrever um texto novo).
-- **Observa:** ataques detectados e que passaram, falsos alarmes sobre registros normais, chamadas que falharam, os totais da rodada, o texto em vigor, os textos de referência `B` e `R`, as notas testadas e as doze medições de custo mais recentes, cada uma com a versão e a nota medidas. As notas chegam ao modelo sempre entre `<untrusted_note>` e `</untrusted_note>`, declaradas como texto do adversário e nunca como instrução.
+- **Observa:** ataques detectados e que passaram, falsos alarmes sobre registros normais, chamadas que falharam, os totais da rodada, o texto em vigor, os textos de referência `B` e `R`, as notas testadas e as doze medições de custo mais recentes, cada uma com a versão e a nota medidas; o estado da sessão, que o modelo também vê, guarda todas as medições, não só as doze. As notas chegam ao modelo sempre entre `<untrusted_note>` e `</untrusted_note>`, declaradas como texto do adversário e nunca como instrução.
 - **Regras de decisão**, no prompt de sistema: reforçar quando ataques passam sem alerta; relaxar de volta para `B` quando não há nota ativa e o texto mais forte causa falsos alarmes evitáveis.
 - **Limites impostos pelo código:**
   - o rótulo de cada texto é dado pelo código (`B`, `R`, depois `V3`, `V4`, …) e o rótulo que o modelo escrever é ignorado; `keep` significa o texto em vigor, qualquer que seja o texto devolvido;
@@ -55,7 +60,7 @@ As instruções básicas `B` são o texto `state.instructions` de `prompts/nsl-k
   - uma proposta recusada volta ao modelo com o motivo; uma segunda recusa conta como manter;
   - não há limite de revisões nem de tamanho do texto.
 
-`--attacker` e `--defender` aceitam `hydrogen` (modelo `gemini-4-hydrogen`, pelo endpoint compatível com OpenAI da API Gemini, com temperatura 0), `claude` (`claude-sonnet-5-5`), `gemini`, `openai` e `deepseek` (`jev_ids/agent_runtime.py`). Antes da rodada 1, cada modelo responde a uma pergunta trivial no mesmo formato estruturado das decisões; se a chamada falhar, o comando para sem chamar o detector.
+`--attacker` e `--defender` aceitam `qwen` (modelo `Qwen3.8-27B`, pelo TokenLab, com pedidos em stream), `hydrogen` (modelo `gemini-4-hydrogen`, pelo endpoint compatível com OpenAI da API Gemini, com temperatura 0), `claude` (`claude-sonnet-5-5`), `gemini`, `openai` e `deepseek` (`jev_ids/agent_runtime.py`). Antes da rodada 1, cada modelo responde a uma pergunta trivial no mesmo formato estruturado das decisões; se a chamada falhar, o comando para sem chamar o detector.
 
 ## 3. Arquitetura
 
@@ -64,7 +69,7 @@ As instruções básicas `B` são o texto `state.instructions` de `prompts/nsl-k
 flowchart TD
     S["Orquestrador · jev_ids/adversarial.py<br/>rodada n: nota e instruções em vigor"]
     S --> E["Avaliador · jev_ids/evaluator.py<br/>nota só no service dos registros de ataque"]
-    E <-->|"um registro por chamada"| D["Detector: gemini_decision, jev ou llm:*<br/>alerta se p_attack ≥ 0,5"]
+    E <-->|"um registro por chamada"| D["Detector: gemini_decision, systemone, jev ou llm:*<br/>alerta se p_attack ≥ 0,5"]
     E -.->|"uma linha por chamada"| P[("results/adv_*/predictions.jsonl")]
     E --> C["Orquestrador<br/>contagens da rodada"]
     C -->|"contagens dos próprios registros"| MA[("Memória do atacante<br/>attacker.db")]
@@ -191,7 +196,7 @@ uv run jev-ids adversarial `
 
 **O que o comando imprime.** Se o modelo de um agente falha na pergunta de verificação, o comando termina antes da rodada 1 com a mensagem `agent model unavailable before the first round, no detector call was made`. Ao final, imprime na saída padrão um CSV com uma linha por rodada e as mesmas colunas de `rounds.jsonl`. Se o laço parou por falha, imprime as rodadas e termina com `stopped: <motivo> at round <n> of <pasta>; the rows judged so far are kept`, seguida do comando que continua a execução.
 
-**Se a execução parar.** Uma queda passageira do TokenLab não derruba a execução: o pedido espera, com paciência de até cerca de uma hora, e a rodada segue quando o serviço volta (`jev_ids/rate_limit.py`). Se ela parar mesmo assim, porque a queda passou disso, porque um agente respondeu fora do formato ou porque o processo foi interrompido, `uv run jev-ids resume results/adv_<...>` continua da rodada em que parou, na mesma pasta e com a mesma memória dos agentes, sem voltar à rodada 1. Depois de uma falha de agente, a rodada já foi julgada e contada aos dois lados, então os números dela são relidos das próprias linhas, sem chamar o detector de novo, e só a decisão que falhou é pedida outra vez. Depois de o detector parar de responder, a rodada interrompida não foi contada a ninguém: as linhas dela vão para `interrupted.jsonl` e ela é julgada de novo do começo. Se o processo cair no meio de uma rodada (queda de energia, aplicativo fechado), não fica linha de falha. O comando lê como a rodada começou em `round_in_play.json`, gravado no início de cada rodada, ou, numa execução anterior a esse arquivo, nas próprias linhas da rodada. Se os dois lados já tinham sido informados da rodada, o que o livro de custos do defensor mostra, só a decisão é pedida de novo; se não, a rodada é julgada outra vez desde o começo. Uma execução que terminou em `stable` não parou por falha, e `resume` a recusa. Com `uv run jev-ids resume results/adv_<...> --past-stable`, ela segue da rodada seguinte com a mesma nota, as mesmas instruções e a mesma memória dos agentes, sem julgar nem perguntar nada de novo, e volta a parar na próxima rodada em que os dois lados mantiverem. Isso serve para continuar uma execução depois de corrigir o prompt de um agente. Cada retomada fica registrada em `config.json` (`resumed`: quando, em que rodada e depois de quê). O teste `tests/test_resume.py` interrompe o ciclo canônico, por queda do atacante, do detector ou do próprio processo, e exige que a execução retomada termine idêntica à que não parou, rodada por rodada. Ele também continua uma execução encerrada em `stable`, exige que ela pare de novo na rodada seguinte em que os dois lados mantêm e que, cortada no meio da continuação, termine idêntica à que não foi cortada.
+**Se a execução parar.** Uma queda passageira do TokenLab não derruba a execução: o pedido espera, com paciência de até cerca de uma hora, e a rodada segue quando o serviço volta (`jev_ids/rate_limit.py`). Se ela parar mesmo assim, porque a queda passou disso, porque um agente respondeu fora do formato ou porque o processo foi interrompido, `uv run jev-ids resume results/adv_<...>` continua da rodada em que parou, na mesma pasta e com a mesma memória dos agentes, sem voltar à rodada 1. Depois de uma falha de agente, a rodada já foi julgada e contada aos dois lados, então os números dela são relidos das próprias linhas, sem chamar o detector de novo, e a decisão da rodada é pedida outra vez, a começar pelo lado que tinha a vez: se esse lado tinha mantido e foi o outro que falhou, os dois são consultados de novo. Depois de o detector parar de responder, a rodada interrompida não foi contada a ninguém: as linhas dela vão para `interrupted.jsonl` e ela é julgada de novo do começo. Se o processo cair no meio de uma rodada (queda de energia, aplicativo fechado), não fica linha de falha. O comando lê como a rodada começou em `round_in_play.json`, gravado no início de cada rodada, ou, numa execução anterior a esse arquivo, nas próprias linhas da rodada. Se os dois lados já tinham sido informados da rodada, o que o livro de custos do defensor mostra, só a decisão é pedida de novo; se não, a rodada é julgada outra vez desde o começo. Uma execução que terminou em `stable` não parou por falha, e `resume` a recusa. Com `uv run jev-ids resume results/adv_<...> --past-stable`, ela segue da rodada seguinte com a mesma nota, as mesmas instruções e a mesma memória dos agentes, sem julgar nem perguntar nada de novo, e volta a parar na próxima rodada em que os dois lados mantiverem. Isso serve para continuar uma execução depois de corrigir o prompt de um agente. Cada retomada fica registrada em `config.json` (`resumed`: quando, em que rodada e depois de quê). O teste `tests/test_resume.py` interrompe o ciclo canônico, por queda do atacante, do detector ou do próprio processo, e exige que a execução retomada termine idêntica à que não parou, rodada por rodada. Ele também continua uma execução encerrada em `stable`, exige que ela pare de novo na rodada seguinte em que os dois lados mantêm e que, cortada no meio da continuação, termine idêntica à que não foi cortada.
 
 **Acompanhar ao vivo.** Em outro terminal, `uv run --no-sync python -m scripts.watch_adversarial` segue a execução iniciada ou retomada por último em `results/`: mostra uma linha por rodada já julgada, depois o andamento da rodada em curso, e, quando a execução termina, espera a próxima. Ele só lê `config.json`, `rounds.jsonl` e `predictions.jsonl`, então abrir ou fechar o monitor não interfere na execução; `--no-sync` evita que o uv mexa no ambiente que a execução está usando.
 
@@ -211,7 +216,7 @@ uv run jev-ids adversarial `
 **Validação offline**, sem rede e sem chaves (seção 8). O `--no-cov` desliga o limite de cobertura que o `pyproject.toml` aplica à suíte inteira.
 
 ```bash
-uv run pytest tests/test_turns.py tests/test_evaluator.py tests/test_agents.py tests/test_agent_runtime.py tests/test_adversarial.py tests/test_gemini_decision.py --no-cov
+uv run pytest tests/test_turns.py tests/test_evaluator.py tests/test_agents.py tests/test_agent_runtime.py tests/test_adversarial.py tests/test_gemini_decision.py tests/test_systemone.py tests/test_resume.py tests/test_rate_limit.py tests/test_streamed_chat.py --no-cov
 ```
 
 ## 6. Evidências e resultados
@@ -338,7 +343,7 @@ uv run --with matplotlib python -m scripts.plot_long_comparison results/adv_nsl-
 |---|---|---|
 | Interação e recorte | nota em `service` contra instruções do detector; atacante caixa-preta; defensor vê as notas testadas; demais atributos, exemplos, modelo e limiar 0,5 fixos | mantido (seções 1 e 2) |
 | Ações iniciais | rodada 1 sem decisão, com a nota que alega manutenção autorizada (`N`) e as instruções básicas (`B`); `R` declara os valores do registro dados não confiáveis | mantido |
-| Detectores | Qwen3:8b, via Ollama, e Laya multilingual, executados localmente no lugar do modelo Jev e avaliados separadamente | `gemini_decision`, `jev`, `llm:deepseek`, `llm:openai` e `llm:gemini`; não há Qwen, Laya nem Ollama |
+| Detectores | Qwen3:8b, via Ollama, e Laya multilingual, executados localmente no lugar do modelo Jev e avaliados separadamente | `gemini_decision`, `systemone` (Clef, no TokenLab), `jev`, `llm:deepseek`, `llm:openai` e `llm:gemini`; não há Qwen3:8b nem Laya como detector, nem Ollama (o Qwen do projeto é o modelo do atacante) |
 | Base de código | `Tucelos/Jev-ids-adversarial` (branch Developer), com a nota inserida por `jev_ids/context.py` | cópia de `jev-sec/jev-ids` no commit `71e57a7`; a nota é inserida por `jev_ids/evaluator.py` |
 | Agentes | atacante caixa-preta e defensor adaptativo, sem implementação definida | agentes Agno com modelo de linguagem e memória SQLite própria |
 | Ações do defensor | `B` ou `R`, a matriz 2×2 | `B`, `R` ou um texto próprio (`V3`, `V4`, …); estados como `N/V3` ficam fora da matriz |
@@ -354,9 +359,9 @@ uv run --with matplotlib python -m scripts.plot_long_comparison results/adv_nsl-
 
 ## 8. Testes offline e dashboard
 
-Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py`, `tests/test_gemini_decision.py` e `tests/test_systemone.py`) rodam sem rede e sem chaves, e todos passam. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
+Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py`, `tests/test_gemini_decision.py`, `tests/test_systemone.py` e `tests/test_resume.py`) e do transporte do TokenLab (`tests/test_rate_limit.py` e `tests/test_streamed_chat.py`) rodam sem rede e sem chaves, e todos passam. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
 
-Os testes provam a mecânica do laço: a regra de turno, os vetos, o orçamento, os rótulos das versões, o que cada lado pode ver, os arquivos gravados e o tratamento de falhas. Não provam como modelos e detectores reais se comportam. A trajetória `N/B → N/R → S/R → S/B → N'/B` do teste canônico, em `tests/test_adversarial.py`, sai do roteiro, e os números dos testes não são resultados.
+Os testes provam a mecânica do laço: a regra de turno, os vetos, o orçamento, os rótulos das versões, o que cada lado pode ver, os arquivos gravados, o tratamento de falhas e a retomada. Não provam como modelos e detectores reais se comportam. A trajetória `N/B → N/R → S/R → S/B → N'/B` do teste canônico, em `tests/test_adversarial.py`, sai do roteiro, e os números dos testes não são resultados.
 
 O [dashboard](docs/dashboard.html) reproduz esse teste roteirizado rodada a rodada e monta comandos de execução. Os números que ele mostra vêm do dublê e do roteiro, não de uma execução.
 
@@ -393,9 +398,9 @@ A equipe é a mesma do Trabalho 1. Cada integrante descreve aqui a própria cont
 | nome a confirmar | a preencher |
 | nome a confirmar | a preencher |
 
-Até o commit `141c295`, o histórico do repositório tem seis commits de Tuigg Barcelos sobre os 103 commits dos autores originais do Jev IDS.
+Até o commit `d10bd4d`, o histórico do repositório tem 32 commits de Tuigg Barcelos sobre os 103 commits dos autores originais do Jev IDS.
 
-**Uso de IA.** A implementação e este texto foram produzidos com apoio de IA, registrado nos trailers `Co-Authored-By` dos commits. Cada integrante deve registrar o próprio uso de IA e a própria verificação.
+**Uso de IA.** A implementação e este texto foram produzidos com apoio de IA. Cada integrante deve registrar o próprio uso de IA e a própria verificação.
 
 ## 11. Dados, licença e créditos
 

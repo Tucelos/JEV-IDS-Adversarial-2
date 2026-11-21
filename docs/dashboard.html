@@ -156,6 +156,7 @@
             <span class="font-medium text-[var(--muted-foreground)]">Detector (--detector)</span>
             <select id="cfg-detector" class="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm">
               <option value="gemini_decision">gemini_decision (gemini-decision-1)</option>
+              <option value="systemone">systemone (Clef, TokenLab)</option>
               <option value="jev">jev (jev-1.13.0)</option>
               <option value="llm:gemini">llm:gemini</option>
               <option value="llm:openai">llm:openai</option>
@@ -165,8 +166,9 @@
           <label class="space-y-1 block">
             <span class="font-medium text-[var(--muted-foreground)]">Atacante Agno (--attacker)</span>
             <select id="cfg-attacker" class="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm">
-              <option value="claude">claude (claude-sonnet-5-5)</option>
-              <option value="hydrogen" selected>hydrogen (gemini-4-hydrogen)</option>
+              <option value="qwen" selected>qwen (Qwen3.8-27B, TokenLab)</option>
+              <option value="claude">claude (claude-sonnet-5-5; recusa o papel)</option>
+              <option value="hydrogen">hydrogen (gemini-4-hydrogen; recusa o papel)</option>
               <option value="gemini">gemini</option>
               <option value="openai">openai</option>
               <option value="deepseek">deepseek</option>
@@ -176,6 +178,7 @@
             <span class="font-medium text-[var(--muted-foreground)]">Defensor Agno (--defender)</span>
             <select id="cfg-defender" class="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm">
               <option value="hydrogen">hydrogen (gemini-4-hydrogen)</option>
+              <option value="qwen">qwen (Qwen3.8-27B, TokenLab)</option>
               <option value="claude">claude (claude-sonnet-5-5)</option>
               <option value="gemini">gemini</option>
               <option value="openai">openai</option>
@@ -319,21 +322,26 @@
 
     const STEPS = [
       { id: "sync", title: "1. Instalar dependências com uv", desc: "Instala Agno (`anthropic`, `openai`, `google`, `sqlite`), `google-genai>=3.2.0` (`client.decisions.create`) e ferramentas de verificação.", cmd: "cd jev-ids && uv sync" },
-      { id: "env", title: "2. Configurar chaves no arquivo .env", desc: "Nunca leia nem exiba chaves em logs ou git. Defina em `jev-ids/.env` apenas os provedores escolhidos para detector, atacante e defensor.", cmd: "GEMINI_API_KEY=... ; ANTHROPIC_API_KEY=... ; TYPESAFE_API_KEY=..." },
-      { id: "offline", title: "3. Rodar testes e qualidade offline", desc: "Roda os testes offline do detector Gemini Decision, dos agentes Agno isolados e da trajetória N/B → N′/B, sem rede e sem custo. Eles usam dublês no lugar dos modelos reais: conferem o encadeamento do código, não o comportamento de um modelo de verdade.", cmd: "uv run pytest tests/test_gemini_decision.py tests/test_adversarial.py -v --no-cov" },
-      { id: "run", title: "4. Executar o estudo e analisar métricas", desc: "Executa o subcomando `adversarial` no split desejado e lê `rounds.jsonl` + métricas agregadas.", cmd: "uv run jev-ids adversarial --dataset data/nsl-kdd/dataset.json --split smoke --detector gemini_decision --attacker claude --defender hydrogen" }
+      { id: "env", title: "2. Configurar chaves no arquivo .env", desc: "Nunca leia nem exiba chaves em logs ou git. Defina em `jev-ids/.env` apenas os provedores escolhidos para detector, atacante e defensor. `QWEN_API_KEY` (TokenLab) atende o agente `qwen` e o detector `systemone`.", cmd: "GEMINI_API_KEY=... ; QWEN_API_KEY=... ; ANTHROPIC_API_KEY=... ; TYPESAFE_API_KEY=..." },
+      { id: "offline", title: "3. Rodar testes e qualidade offline", desc: "Roda os testes offline do laço (regra de turno, avaliador, agentes Agno, orquestrador, detectores Gemini Decision e Clef, retomada) e do transporte do TokenLab, sem rede e sem custo. Eles usam dublês no lugar dos modelos reais: conferem o encadeamento do código, não o comportamento de um modelo de verdade.", cmd: "uv run pytest tests/test_turns.py tests/test_evaluator.py tests/test_agents.py tests/test_agent_runtime.py tests/test_adversarial.py tests/test_gemini_decision.py tests/test_systemone.py tests/test_resume.py tests/test_rate_limit.py tests/test_streamed_chat.py --no-cov" },
+      { id: "run", title: "4. Executar o estudo e analisar métricas", desc: "Executa o subcomando `adversarial` no split desejado e lê `rounds.jsonl` + métricas agregadas. O atacante precisa ser `qwen`: Claude e Gemini recusam o papel. Se a execução parar, `uv run jev-ids resume results/adv_<...>` continua de onde parou.", cmd: "uv run jev-ids adversarial --dataset data/nsl-kdd/dataset.json --split internal --detector gemini_decision --attacker qwen --defender hydrogen --rounds 5 --max-attempts 3 --k 0" }
     ];
 
     const MODULES = [
       { file: "jev_ids/agents.py", role: "AttackerAgent e DefenderAgent: o que cada lado observa e decide, rótulos das instruções derivados do texto e regras de não repetição." },
-      { file: "jev_ids/agent_runtime.py", role: "make_agent_model (claude, hydrogen, gemini, openai, deepseek), pergunta de verificação antes da rodada 1 e memória Agno em SqliteDb, um arquivo por lado." },
-      { file: "jev_ids/adversarial.py", role: "Orquestrador não-LLM, reinforce_instructions, paradas (stable, detector_stopped, agent_unavailable) e persistência config.json / rounds.jsonl." },
+      { file: "jev_ids/agent_runtime.py", role: "make_agent_model (qwen, claude, hydrogen, gemini, openai, deepseek), pergunta de verificação antes da rodada 1 e memória Agno em SqliteDb, um arquivo por lado." },
+      { file: "jev_ids/adversarial.py", role: "Orquestrador não-LLM, reinforce_instructions, paradas (stable, detector_stopped, agent_unavailable), retomada (resume, --past-stable) e persistência config.json / rounds.jsonl." },
       { file: "jev_ids/turns.py", role: "decide_who_adapts: a regra de quem adapta, relativa à rodada anterior (attack_passed, attack_alerted, regime_loosened, defense_under_review)." },
       { file: "jev_ids/evaluator.py", role: "apply_note (somente campo service de ataques) e avaliador de uma rodada, com as chamadas que falharam contadas à parte." },
       { file: "jev_ids/detectors/gemini_decision.py", role: "GeminiDecisionDetector (gemini-decision-1) via google-genai client.decisions.create (noul + choice) sob DecisionDetector." },
+      { file: "jev_ids/detectors/systemone.py", role: "SystemOneDetector: o modelo Clef pelo TokenLab, sob DecisionDetector, com as chamadas espaçadas junto com as do agente qwen." },
+      { file: "jev_ids/rate_limit.py", role: "Espaçador compartilhado que mantém o agente qwen e o detector systemone abaixo de 20 chamadas por minuto no TokenLab, com paciência de cerca de uma hora para quedas passageiras." },
+      { file: "jev_ids/streamed_chat.py", role: "Pedidos de chat do agente qwen em stream, que esperam a vez na fila do gateway em vez de levar 503." },
       { file: "jev_ids/detectors/jev.py", role: "JevDetector existente estendido com propriedade instructions e set_instructions para alternar B e R." },
-      { file: "jev_ids/cli.py", role: "Subcomando `adversarial` adicionado ao lado de run, redo-errors, metrics, compare, sign-test e threshold." },
-      { file: "tests/test_adversarial.py", role: "Testes 100% offline usando ScriptedAgnoModel sobre Agno Agent real para validar isolamento e N/B → N′/B." }
+      { file: "jev_ids/cli.py", role: "Subcomandos `adversarial` e `resume` adicionados ao lado de run, redo-errors, metrics, compare, sign-test e threshold." },
+      { file: "tests/test_adversarial.py", role: "Testes 100% offline usando ScriptedAgnoModel sobre Agno Agent real para validar isolamento e N/B → N′/B." },
+      { file: "tests/test_resume.py", role: "Interrompe o ciclo canônico (queda do atacante, do detector ou do processo) e exige que a execução retomada termine idêntica à que não parou." },
+      { file: "scripts/watch_adversarial.py", role: "Monitor ao vivo: segue a execução iniciada ou retomada por último, só lendo os arquivos." }
     ];
 
     const TABS = [
@@ -430,6 +438,7 @@
     function providerEnv(name) {
       if (name === "claude") return "ANTHROPIC_API_KEY (claude-sonnet-5-5)";
       if (name === "hydrogen") return "HYDROGEN_API_KEY ou GEMINI_API_KEY + HYDROGEN_BASE_URL (gemini-4-hydrogen)";
+      if (name === "qwen") return "QWEN_API_KEY (TokenLab, Qwen3.8-27B)";
       if (name === "gemini") return "gcloud ADC + GOOGLE_GENAI_USE_VERTEXAI=true, GOOGLE_CLOUD_PROJECT e GOOGLE_CLOUD_LOCATION (Vertex AI)";
       if (name === "openai") return "CHATGPT_CLIENT_ID (login OAuth do ChatGPT)";
       return "DEEPSEEK_API_KEY";
@@ -438,6 +447,7 @@
     function detectorEnv(name) {
       if (name === "gemini_decision") return "GEMINI_API_KEY (API Decisions gemini-decision-1)";
       if (name === "jev") return "TYPESAFE_API_KEY (jev-1.13.0)";
+      if (name === "systemone") return "QWEN_API_KEY (TokenLab, Clef)";
       return providerEnv(name.replace("llm:", ""));
     }
 
