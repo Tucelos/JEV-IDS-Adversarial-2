@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from jev_ids import holdout
+from jev_ids import cli, holdout
 from jev_ids.dataset import load_config, load_split
 from jev_ids.holdout import CheckPlan, HeldRound, check_rounds, instructions_of, reserved_flows, rounds_to_check
 from tests.adversarial_helpers import (
@@ -192,3 +192,32 @@ def test_a_detector_that_stops_answering_ends_the_check_after_that_round(tmp_pat
     assert line.detection_gap is None
     assert line.attack_errors == line.total_attacks
     assert len(read_jsonl(tmp_path / "rounds.jsonl")) == 1
+
+
+def test_cli_holdout_prints_one_row_per_round_and_refuses_a_second_check(
+    run_dir: Path, detector: MockDecisionDetector, capsys: pytest.CaptureFixture[str]
+) -> None:
+    del detector
+    assert cli.main(["holdout", str(run_dir), "--split", RESERVED, "--rounds", "1,2"]) == 0
+    printed = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+    assert [row["state_code"] for row in printed] == ["N/B", "N/R"]
+    assert {"adapted_detection_rate", "held_out_detection_rate", "detection_gap", "reused_from"} <= set(printed[0])
+    with pytest.raises(SystemExit, match="already holds a check"):
+        cli.main(["holdout", str(run_dir), "--split", RESERVED])
+
+
+def test_cli_holdout_exits_non_zero_when_the_detector_stops(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    flows = load_split(NSL_KDD_CARD.parent / "splits" / f"{RESERVED}.csv", load_config(NSL_KDD_CARD))
+    double = MockDecisionDetector(failing={flow.row_id for flow in flows})
+    install(monkeypatch, double)
+    with pytest.raises(SystemExit, match="stopped answering at round 1"):
+        cli.main(["holdout", str(run_dir), "--split", RESERVED])
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+@pytest.mark.parametrize("text", ["0", "", "a,b", "2,-1"])
+def test_cli_holdout_refuses_rounds_that_are_not_integers_from_one(text: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["holdout", "results/x", "--split", RESERVED, "--rounds", text])
