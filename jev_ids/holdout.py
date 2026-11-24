@@ -10,19 +10,31 @@ In reading order:
 - `HeldRound` and `rounds_to_check`: the rounds of a run that judged every Flow, with their note and their instructions.
 - `instructions_of`: the text of one instruction version, checked against the sha256 the rows carry.
 - `reserved_flows`: the held-out split without any Flow the run adapted on.
+- `HoldoutRecord` and `check_rounds`: one judgement of the reserved split per distinct (note, instructions) pair, one line per round.
+- `holdout_from_run`: the CLI entry that strings the above together into `<run_dir>/holdout_<split>/`.
 
-The judgement of the reserved split comes next; this part only reads what a finished run left and what the reserved split holds.
+Two rounds with the same note and the same instructions ask the detector the same question, so the reserved split is judged once for the
+pair and the later round says which round it reuses (`reused_from`). A call that fails is counted apart, as in `evaluator.py`, and the rates
+read the answered Flows only.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Collection
-from dataclasses import dataclass
+import json
+from collections.abc import Collection, Sequence
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+from typing import Any, cast
 
-from jev_ids.adversarial import DETECTOR_STOPPED, read_rounds
-from jev_ids.dataset import Config, Flow, load_split
+from jev_ids import records
+from jev_ids.adversarial import DETECTOR_STOPPED, read_rounds, spec_of
+from jev_ids.dataset import Config, Flow, load_config, load_split
+from jev_ids.detectors import DecisionDetector
+from jev_ids.evaluator import RoundCounts, RoundEvaluation, RoundPlan, evaluate_round, service_feature_index
+from jev_ids.run import RunSpec, build_detector, sample_examples
 
 
 @dataclass(frozen=True)
@@ -115,3 +127,209 @@ def reserved_flows(config: Config, adapted_on: str, held_out: str) -> tuple[list
     if not kept:
         raise ValueError(f"every Flow of {held_out!r} is also in {adapted_on!r}")
     return kept, len(candidates) - len(kept)
+
+
+@dataclass(frozen=True)
+class HoldoutRecord:
+    """One line of `holdout_<split>/rounds.jsonl`: a round of the run, measured on the split it adapted on and on the reserved one.
+
+    Attributes:
+        round: the round of the run.
+        state_code: its compact code.
+        note: the note in force.
+        instruction_label: the label of the instructions in force.
+        split: the reserved split.
+        adapted_detection_rate: the detection rate the run measured on its own split.
+        held_out_detection_rate: the detection rate on the reserved split.
+        adapted_false_alarm_rate: the false-alarm rate on the run's own split.
+        held_out_false_alarm_rate: the false-alarm rate on the reserved split.
+        adapted_f1: the F1 on the run's own split.
+        held_out_f1: the F1 on the reserved split.
+        detection_gap: held-out detection minus adapted detection; negative when the round did worse on unseen Flows.
+        reused_from: the earlier round whose judgement this one reuses, None when this round was judged itself.
+        stopped: whether the detector stopped answering on the reserved split.
+    """
+
+    round: int
+    state_code: str
+    note: str
+    instruction_label: str
+    split: str
+    adapted_detection_rate: float | None
+    held_out_detection_rate: float | None
+    adapted_false_alarm_rate: float
+    held_out_false_alarm_rate: float
+    adapted_f1: float
+    held_out_f1: float
+    detection_gap: float | None
+    attacks_detected: int
+    attacks_passed: int
+    attack_errors: int
+    false_alarms: int
+    benign_errors: int
+    total_attacks: int
+    total_benign: int
+    reused_from: int | None
+    stopped: bool
+
+
+def _record(item: HeldRound, split: str, evaluation: RoundEvaluation, reused_from: int | None) -> HoldoutRecord:
+    """The line of one round, from what the run measured and what the reserved split gave."""
+    counts: RoundCounts = evaluation.counts
+    held_rate = detection_rate(counts.attacks_detected, counts.total_attacks, counts.attack_errors)
+    gap = None if held_rate is None or item.detection_rate is None else round(held_rate - item.detection_rate, 4)
+    return HoldoutRecord(
+        round=item.round,
+        state_code=item.state_code,
+        note=item.note,
+        instruction_label=item.instruction_label,
+        split=split,
+        adapted_detection_rate=item.detection_rate,
+        held_out_detection_rate=held_rate,
+        adapted_false_alarm_rate=item.false_alarm_rate,
+        held_out_false_alarm_rate=evaluation.false_alarm_rate,
+        adapted_f1=item.f1,
+        held_out_f1=round(evaluation.f1, 4),
+        detection_gap=gap,
+        reused_from=reused_from,
+        stopped=evaluation.stopped,
+        **asdict(counts),
+    )
+
+
+def _append(out_dir: Path | None, name: str, line: dict[str, Any]) -> None:
+    """Append one JSON line to `out_dir/name`; no folder writes nothing."""
+    if out_dir is None:
+        return
+    with (out_dir / name).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+@dataclass(frozen=True)
+class CheckPlan:
+    """What every judgement of the reserved split shares.
+
+    Attributes:
+        split: the reserved split, by name.
+        flows: its Flows, without those of the split the run adapted on.
+        examples: the labeled Examples of the run, the same in every judgement.
+        service_index: where `service` sits among the card's features.
+        max_note_length: the run's longest note, in characters.
+        fields: the fields every row shares.
+    """
+
+    split: str
+    flows: Sequence[Flow]
+    examples: Sequence[Flow]
+    service_index: int
+    max_note_length: int
+    fields: dict[str, Any]
+
+
+def check_rounds(
+    detector: DecisionDetector,
+    run_dir: Path,
+    rounds: Sequence[HeldRound],
+    plan: CheckPlan,
+    out_dir: Path | None = None,
+) -> list[HoldoutRecord]:
+    """Judge the reserved split under each round's note and instructions, once per distinct pair, and write one line per round.
+
+    The rows go to `out_dir/predictions.jsonl` right after each call and the lines to `out_dir/rounds.jsonl`, so a check that fails
+    later loses nothing already paid for. A detector that stops answering ends the check after that round's line.
+    """
+    judged: dict[tuple[str, str], tuple[int, RoundEvaluation]] = {}
+    lines: list[HoldoutRecord] = []
+    for item in rounds:
+        key = (item.note, item.instructions_sha256)
+        if key in judged:
+            first, evaluation = judged[key]
+            lines.append(_record(item, plan.split, evaluation, first))
+        else:
+            detector.set_instructions(instructions_of(run_dir, item.instruction_label, item.instructions_sha256))
+            fields = {
+                **plan.fields,
+                "round": item.round,
+                "instruction_label": item.instruction_label,
+                "instructions_sha256": item.instructions_sha256,
+            }
+            round_plan = RoundPlan(item.note, plan.service_index, plan.max_note_length, fields)
+            sink = partial(_append, out_dir, "predictions.jsonl")
+            evaluation = evaluate_round(detector, plan.flows, plan.examples, round_plan, sink)
+            judged[key] = (item.round, evaluation)
+            lines.append(_record(item, plan.split, evaluation, None))
+        _append(out_dir, "rounds.jsonl", asdict(lines[-1]))
+        if lines[-1].stopped:
+            break
+    return lines
+
+
+def holdout_from_run(run_dir: Path, split: str, wanted: Collection[int] | None = None) -> tuple[Path, list[HoldoutRecord]]:
+    """Check a finished adversarial run on a reserved split, into `<run_dir>/holdout_<split>/`.
+
+    The detector, its model, the record format, k and the seed are the run's own (`adversarial.spec_of`); the agents are never built.
+
+    Args:
+        run_dir: the `results/adv_*` folder of the run.
+        split: the reserved split, a file under `data/<name>/splits/`.
+        wanted: the rounds to check; None checks every round that judged every Flow.
+
+    Returns:
+        The folder written and one line per round checked.
+
+    Raises:
+        ValueError: when the folder already holds a check of that split, or the splits or rounds cannot be checked.
+    """
+    spec = spec_of(run_dir)
+    config = load_config(spec.dataset)
+    rounds = rounds_to_check(run_dir, wanted)
+    flows, dropped = reserved_flows(config, spec.split, split)
+    out_dir = run_dir / f"holdout_{split}"
+    if (out_dir / "rounds.jsonl").exists():
+        raise ValueError(f"{out_dir} already holds a check; remove the folder to judge it again")
+    examples: list[Flow] = []
+    if spec.k > 0:
+        examples = sample_examples(load_split(config["dir"] / "pool.csv", config), spec.k, spec.seed, config["categories"])
+    run_spec = RunSpec(
+        detector=spec.detector,
+        dataset=spec.dataset,
+        split=split,
+        k_values=(spec.k,),
+        seeds=(spec.seed,),
+        model_id=spec.detector_model,
+        record=spec.record,
+    )
+    detector = cast(DecisionDetector, build_detector(run_spec, config))
+    fields: dict[str, Any] = {
+        "dataset": config["name"],
+        "detector": detector.name,
+        "model": detector.model,
+        "split": split,
+        "adapted_on": spec.split,
+        "prompt_hash": detector.prompt_hash,
+        "record": spec.record,
+        "k": spec.k,
+        "seed": spec.seed,
+        "holdout": True,
+    }
+    records.write_config(
+        out_dir,
+        {
+            "mode": "holdout",
+            "source_run": run_dir.name,
+            "adapted_on": spec.split,
+            "split": split,
+            "flows": len(flows),
+            "attacks": sum(1 for flow in flows if flow.is_attack),
+            "dropped_shared_flows": dropped,
+            "rounds": [item.round for item in rounds],
+            "detector": detector.name,
+            "detector_model": detector.model,
+            "record": spec.record,
+            "k": spec.k,
+            "seed": spec.seed,
+            "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        },
+    )
+    plan = CheckPlan(split, flows, examples, service_feature_index(config), spec.max_note_length, fields)
+    return out_dir, check_rounds(detector, run_dir, rounds, plan, out_dir)
