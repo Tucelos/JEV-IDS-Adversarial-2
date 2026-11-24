@@ -1,11 +1,12 @@
-"""The command line: `jev-ids run|redo-errors|metrics|compare|sign-test|threshold|adversarial`, also reachable as `python -m jev_ids`.
+"""The command line: `jev-ids run|redo-errors|metrics|compare|sign-test|threshold|adversarial|resume|holdout`, or `python -m jev_ids`.
 
 In reading order:
 
 - `parse_k` and `parse_list`: the list arguments (`--k 0,1,all`).
 - `build_parser`: the subcommands and their arguments.
-- `run_command`, `redo_command`, `metrics_command`, `compare_command`, `sign_test_command`, `threshold_command`, `adversarial_command`:
-  one handler per subcommand, each turning the parsed arguments into calls of `run`, `metrics` or `adversarial`.
+- `run_command`, `redo_command`, `metrics_command`, `compare_command`, `sign_test_command`, `threshold_command`, `adversarial_command`,
+  `resume_command`, `holdout_command`: one handler per subcommand, each turning the parsed arguments into calls of `run`, `metrics`,
+  `adversarial` or `holdout`.
 - `read_runs`: the rows of the run directories given, cut again at a threshold when one is given.
 - `print_csv`: a table as CSV on stdout.
 - `main`: parse, dispatch, return the exit code.
@@ -23,7 +24,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from jev_ids import ROOT, adversarial, metrics, run
+from jev_ids import ROOT, adversarial, holdout, metrics, run
 from jev_ids.agent_runtime import AgentUnavailableError
 from jev_ids.controller import BETA
 from jev_ids.dataset import RECORDS
@@ -148,7 +149,26 @@ def build_parser() -> argparse.ArgumentParser:
         "next such round",
     )
     resumer.set_defaults(handler=resume_command)
+    _add_holdout_parser(commands)
     return parser
+
+
+def _add_holdout_parser(commands: Any) -> None:
+    held = commands.add_parser(
+        "holdout", help="judge a reserved split under each round's note and instructions of a finished adversarial run"
+    )
+    held.add_argument("run_dir", type=Path, help="results/adv_* directory of the run")
+    held.add_argument("--split", required=True, help="the reserved split under data/<name>/splits/, other than the one the run adapted on")
+    held.add_argument("--rounds", type=parse_rounds, help="rounds to check, comma separated; default: every round that judged every flow")
+    held.set_defaults(handler=holdout_command)
+
+
+def parse_rounds(text: str) -> tuple[int, ...]:
+    """The rounds of `holdout --rounds 1,5`, each an integer from 1."""
+    rounds = tuple(int(part) for part in text.split(",") if part.strip())
+    if not rounds or min(rounds) < 1:
+        raise argparse.ArgumentTypeError(f"{text!r}: give the rounds as integers from 1, comma separated")
+    return rounds
 
 
 def _add_adversarial_parser(commands: Any) -> None:
@@ -291,6 +311,23 @@ def resume_command(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     report_rounds(run_dir, history)
+
+
+def holdout_command(args: argparse.Namespace) -> None:
+    """`holdout`: judge a reserved split under each round of a finished run and print one CSV row per round.
+
+    The command exits non-zero when the run or the splits cannot be checked, and, after the rows are printed, when the detector stopped
+    answering on the reserved split.
+    """
+    try:
+        out_dir, lines = holdout.holdout_from_run(args.run_dir, args.split, args.rounds)
+    except (ValueError, FileNotFoundError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print_csv([asdict(line) for line in lines])
+    if lines and lines[-1].stopped:
+        raise SystemExit(
+            f"stopped: the detector stopped answering at round {lines[-1].round} of {out_dir}; the rows judged so far are kept"
+        )
 
 
 def report_rounds(run_dir: Path, history: Sequence[adversarial.RoundRecord]) -> None:

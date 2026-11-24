@@ -14,7 +14,8 @@ Este repositório é o protótipo do sistema adversarial proposto no Trabalho 1.
 | Adicionados | `tests/adversarial_helpers.py`, `tests/test_adversarial.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_evaluator.py`, `tests/test_turns.py`, `tests/test_gemini_decision.py`, `tests/test_systemone.py`, `tests/test_resume.py`, `tests/test_rate_limit.py`, `tests/test_streamed_chat.py` | testes offline do laço e do transporte do TokenLab |
 | Adicionados | `docs/dashboard.html`, `README.jev-ids.md` | reprodução visual do teste roteirizado; README original |
 | Adicionados | `results/adv_*/`, `results/comparison/` | as execuções do laço e seus gráficos (seção 6) |
-| Alterado | `jev_ids/cli.py` | subcomandos `adversarial` e `resume`, e saída em UTF-8 |
+| Adicionados | `jev_ids/holdout.py`, `tests/test_holdout.py` | conferência de uma execução num split reservado (seção 5, "Conferir num conjunto reservado") e seus testes offline |
+| Alterado | `jev_ids/cli.py` | subcomandos `adversarial`, `resume` e `holdout`, e saída em UTF-8 |
 | Alterados | `jev_ids/detectors/__init__.py`, `jev_ids/detectors/jev.py`, `jev_ids/detectors/llm.py`, `jev_ids/run.py` | interface `DecisionDetector`, que permite trocar as instruções do detector, e construção do `gemini_decision` e do `systemone` |
 | Alterados | `tests/helpers.py`, `tests/test_cli.py` | dublês do TokenLab para os testes novos e teste da saída em UTF-8 |
 | Alterados | `docs/protocol.md`, `docs/results.md` | links para o README original, agora em `README.jev-ids.md` |
@@ -213,10 +214,33 @@ uv run jev-ids adversarial `
 | `interrupted.jsonl` | as linhas de uma rodada interrompida porque o detector parou de responder, que é julgada de novo do começo; só existe se isso aconteceu | sim |
 | `memory/attacker.db`, `memory/defender.db` | a memória SQLite de cada agente, quando `--memory-dir` não é informado | não, o git ignora |
 
+**Conferir num conjunto reservado.** Toda rodada adapta e é julgada no mesmo split, então uma defesa que funciona ali pode servir só para aqueles registros, e uma nota que passa ali pode enganar o detector só neles. O subcomando `holdout` pega uma execução já terminada e julga um segundo split, que nenhum agente viu, com a nota e as instruções que cada rodada teve em vigor:
+
+```bash
+uv run jev-ids holdout results/adv_<...> --split hard
+uv run jev-ids holdout results/adv_<...> --split pilot --rounds 1,2,5
+```
+
+- **O que fica igual:** o detector, o modelo, o formato do registro, `--k` e a semente são os da execução (lidos de `config.json`); o texto de cada versão vem de `instructions/<rótulo>.txt` e é recusado se o SHA-256 não bater com o de `rounds.jsonl`. A nota vai só no `service` dos registros de ataque, como no laço.
+- **O que nunca acontece:** os agentes não são construídos e suas memórias não são abertas. O conjunto reservado é julgado depois do laço, então não influencia nenhuma decisão (interface I7 do Trabalho 1).
+- **Separação dos splits:** o split reservado tem de ser outro, e todo registro dele que também está no split da execução (mesmo `row_id`) é descartado e contado em `dropped_shared_flows`. Os splits do NSL-KDD em `data/nsl-kdd/splits/` são disjuntos entre si.
+- **Custo:** uma chamada por registro, uma vez para cada par distinto (nota, instruções). Uma rodada que repete um par já julgado reaproveita o resultado e diz de qual rodada (`reused_from`). Nas execuções da seção 6, isso dá 5 julgamentos nas de 5 rodadas, 44 na de 50 rodadas do Gemini Decision e 45 na de 47 do Clef; `--rounds` escolhe só algumas rodadas. O split `hard` tem 100 registros, e o `pilot` tem 300.
+- **Falhas:** uma chamada que falha é contada à parte, fora das taxas, como no laço. Se o detector parar de responder, a conferência termina depois daquela rodada, e o comando sai com código diferente de zero.
+
+A saída é um CSV com uma linha por rodada, também gravado em `results/adv_<...>/holdout_<split>/`:
+
+| Arquivo | Conteúdo |
+|---|---|
+| `config.json` | execução de origem, split adaptado (`adapted_on`) e split reservado, registros julgados e descartados, rodadas conferidas, detector e modelo |
+| `rounds.jsonl` | por rodada: código de estado, nota, rótulo das instruções, taxa de detecção, falso alarme e F1 no split da execução (`adapted_*`) e no reservado (`held_out_*`), `detection_gap` (reservado menos adaptado; negativo quando a rodada se saiu pior em registros novos), as contagens do reservado e `reused_from` |
+| `predictions.jsonl` | uma linha por chamada, com `holdout: true` e os mesmos campos das linhas do laço |
+
+Uma pasta que já tem uma conferência daquele split não é sobrescrita: apague-a para julgar de novo. Como o detector não garante a mesma resposta para a mesma entrada, `detection_gap` mistura generalização e variação do detector; repetir a conferência mostra o tamanho dessa variação.
+
 **Validação offline**, sem rede e sem chaves (seção 8). O `--no-cov` desliga o limite de cobertura que o `pyproject.toml` aplica à suíte inteira.
 
 ```bash
-uv run pytest tests/test_turns.py tests/test_evaluator.py tests/test_agents.py tests/test_agent_runtime.py tests/test_adversarial.py tests/test_gemini_decision.py tests/test_systemone.py tests/test_resume.py tests/test_rate_limit.py tests/test_streamed_chat.py --no-cov
+uv run pytest tests/test_turns.py tests/test_evaluator.py tests/test_agents.py tests/test_agent_runtime.py tests/test_adversarial.py tests/test_gemini_decision.py tests/test_systemone.py tests/test_resume.py tests/test_rate_limit.py tests/test_streamed_chat.py tests/test_holdout.py --no-cov
 ```
 
 ## 6. Evidências e resultados
@@ -349,7 +373,7 @@ uv run --with matplotlib python -m scripts.plot_long_comparison results/adv_nsl-
 | Ações do defensor | `B` ou `R`, a matriz 2×2 | `B`, `R` ou um texto próprio (`V3`, `V4`, …); estados como `N/V3` ficam fora da matriz |
 | Limites | atacante com orçamento de tentativas e tamanho de nota, e cada tentativa consome orçamento; defensor com limite de revisões, de tamanho de texto e de chamadas | orçamento e tamanho do atacante impostos em código, mas só a redação nova consome; o defensor não tem limite além de `--rounds` |
 | Observação do atacante | o veredito de cada tentativa própria | contagens da rodada sobre os próprios registros, inclusive os que mudaram de lado |
-| Conjuntos | o defensor adapta com resultados de desenvolvimento; o conjunto final fica reservado | um único split, julgado em toda rodada e usado para adaptar |
+| Conjuntos | o defensor adapta com resultados de desenvolvimento; o conjunto final fica reservado | o laço adapta e é julgado num único split; o subcomando `holdout` julga depois um split reservado, que nenhum agente vê, com a nota e as instruções de cada rodada (seção 5) |
 | Sequência | `N/B → N/R → S/R → S/B → N′/B`, com sondagem paralela de variantes na terceira rodada; `N′` difere de `N` e o ciclo não volta ao ponto de partida | a sequência é uma hipótese, não imposta; uma nota por rodada para todos os ataques, sem sondagem paralela; o código distingue `N'` de `N`, e memória, redações aposentadas e orçamento atravessam as rodadas |
 | Quem adapta | alerta move o atacante; evasão ou custo de `R` move o defensor; o atacante volta a agir quando volta a passar | regra relativa à rodada anterior (seção 4); "voltou a passar" é `regime_loosened`; o falso alarme não entra na regra, só no custo e no prompt do defensor; se o lado da vez mantém, o outro é consultado |
 | Exemplos rotulados | fixos no contexto do detector | fixos entre rodadas; o comando recomendado usa `--k 0`, sem exemplos |
@@ -359,7 +383,7 @@ uv run --with matplotlib python -m scripts.plot_long_comparison results/adv_nsl-
 
 ## 8. Testes offline e dashboard
 
-Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py`, `tests/test_gemini_decision.py`, `tests/test_systemone.py` e `tests/test_resume.py`) e do transporte do TokenLab (`tests/test_rate_limit.py` e `tests/test_streamed_chat.py`) rodam sem rede e sem chaves, e todos passam. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
+Os testes do laço (`tests/test_turns.py`, `tests/test_evaluator.py`, `tests/test_agents.py`, `tests/test_agent_runtime.py`, `tests/test_adversarial.py`, `tests/test_gemini_decision.py`, `tests/test_systemone.py`, `tests/test_resume.py` e `tests/test_holdout.py`) e do transporte do TokenLab (`tests/test_rate_limit.py` e `tests/test_streamed_chat.py`) rodam sem rede e sem chaves, e todos passam. Neles, as respostas dos agentes vêm de um roteiro: `ScriptedAgnoModel`, em `tests/adversarial_helpers.py`, devolve respostas fixas, na ordem. O detector é um dublê de regras fixas, `MockDecisionDetector`: sob `B`, qualquer nota o engana em um dos ataques; sob `R`, ele pega esse ataque e dá falso alarme num registro normal de serviço raro.
 
 Os testes provam a mecânica do laço: a regra de turno, os vetos, o orçamento, os rótulos das versões, o que cada lado pode ver, os arquivos gravados, o tratamento de falhas e a retomada. Não provam como modelos e detectores reais se comportam. A trajetória `N/B → N/R → S/R → S/B → N'/B` do teste canônico, em `tests/test_adversarial.py`, sai do roteiro, e os números dos testes não são resultados.
 
@@ -369,7 +393,7 @@ O [dashboard](docs/dashboard.html) reproduz esse teste roteirizado rodada a roda
 
 Limitações que valem antes de qualquer execução:
 
-- O mesmo split orienta a adaptação e é julgado em todas as rodadas; não há conjunto reservado para medir se uma adaptação generaliza.
+- O mesmo split orienta a adaptação e é julgado em todas as rodadas. O subcomando `holdout` mede depois, num split reservado, se cada rodada generaliza, mas essa medida não volta ao laço: nenhum agente adapta com base nela.
 - Com `--k 0`, o detector julga sem exemplos rotulados.
 - Uma única nota vale para todos os registros de ataque da rodada; o atacante não testa variantes em paralelo nem ajusta a nota por registro.
 - Nem o detector nem os modelos dos agentes garantem a mesma resposta para a mesma entrada. Uma execução é uma amostra, e uma trajetória isolada não mostra a variação.
@@ -383,7 +407,7 @@ Limitações que valem antes de qualquer execução:
 - A nota em `service` é um canal dado pelo experimento: numa rede real, o atacante não escreve no registro que o IDS lê.
 - O detector e os agentes são serviços externos e pagos, cujos modelos mudam de versão.
 
-Melhorias possíveis: separar um split para adaptar e outro, reservado, para medir; repetir cada configuração e comparar as trajetórias; dar à regra de afrouxamento do atacante uma margem, como `--noise-margin` faz na regra de turno; usar exemplos rotulados fixos (`--k 1` ou mais); permitir variantes de nota por registro; impor limites de revisão e de tamanho ao defensor; levar o falso alarme à regra de turno; avaliar também os detectores planejados no Trabalho 1; exportar em texto legível as conversas dos agentes, que hoje ficam só no SQLite.
+Melhorias possíveis: repetir cada configuração e comparar as trajetórias; dar à regra de afrouxamento do atacante uma margem, como `--noise-margin` faz na regra de turno; usar exemplos rotulados fixos (`--k 1` ou mais); permitir variantes de nota por registro; impor limites de revisão e de tamanho ao defensor; levar o falso alarme à regra de turno; avaliar também os detectores planejados no Trabalho 1; exportar em texto legível as conversas dos agentes, que hoje ficam só no SQLite.
 
 ## 10. Equipe e contribuições
 
